@@ -1,7 +1,7 @@
-// Modified 2026-10-27 for OrdinaryPlace Buddy. SSPL v1; see repository LICENSE.
+// Modified 2026-10-28 for OrdinaryPlace Buddy. SSPL v1; see repository LICENSE.
 //! Private state and JSONL protocol helpers. Validation never connects to Apple.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -14,12 +14,105 @@ use sha2::{Digest, Sha256};
 
 pub const MAX_EXPORT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_COMMAND_BYTES: usize = 128 * 1024;
+pub const MAX_DIAGNOSTIC_ERROR_CODES: usize = 64;
 
 /// Static categories only. Never format a source parser/crypto/network error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorkerError(pub &'static str);
 
 pub type Result<T> = std::result::Result<T, WorkerError>;
+
+/// Counts of typed per-target transport/service results, never delivery proof.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TargetOutcomes {
+    pub accepted: u64,
+    pub rejected: u64,
+    pub timed_out: u64,
+    #[serde(default)]
+    pub error_codes: BTreeMap<i64, u64>,
+    #[serde(default)]
+    pub error_codes_overflow: u64,
+}
+
+impl TargetOutcomes {
+    fn reject(&mut self, code: i64) {
+        self.rejected = self.rejected.saturating_add(1);
+        if let Some(count) = self.error_codes.get_mut(&code) {
+            *count = count.saturating_add(1);
+        } else if self.error_codes.len() < MAX_DIAGNOSTIC_ERROR_CODES {
+            self.error_codes.insert(code, 1);
+        } else {
+            self.error_codes_overflow = self.error_codes_overflow.saturating_add(1);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SendJobState {
+    AwaitingClient,
+    ClientFailed,
+    ClientTimedOut,
+    Completed,
+    Failed,
+    TimedOut,
+}
+
+#[derive(Clone, Copy)]
+pub enum TargetScope { External, Own, Unexpected }
+
+#[derive(Clone, Copy)]
+pub enum TargetOutcome { Accepted, Rejected(i64), TimedOut }
+
+/// A bounded, secret-free summary of the result stream. "accepted" only means
+/// the protocol/service acknowledgement represented by SendResult::Sent.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SendDiagnostics {
+    pub version: u8,
+    pub job_state: SendJobState,
+    pub external: TargetOutcomes,
+    pub own: TargetOutcomes,
+    pub unexpected_results: u64,
+    pub lagged_results: u64,
+    pub stream_closed: bool,
+}
+
+impl Default for SendDiagnostics {
+    fn default() -> Self {
+        Self { version: 1, job_state: SendJobState::AwaitingClient,
+            external: TargetOutcomes::default(), own: TargetOutcomes::default(),
+            unexpected_results: 0, lagged_results: 0, stream_closed: false }
+    }
+}
+
+impl SendDiagnostics {
+    pub fn record(&mut self, scope: TargetScope, outcome: TargetOutcome) {
+        let results = match scope {
+            TargetScope::External => &mut self.external,
+            TargetScope::Own => &mut self.own,
+            TargetScope::Unexpected => {
+                self.unexpected_results = self.unexpected_results.saturating_add(1);
+                return;
+            },
+        };
+        let count = match outcome {
+            TargetOutcome::Accepted => &mut results.accepted,
+            TargetOutcome::Rejected(code) => { results.reject(code); return; },
+            TargetOutcome::TimedOut => &mut results.timed_out,
+        };
+        *count = count.saturating_add(1);
+    }
+
+    pub fn submitted(&self) -> bool {
+        self.version == 1 && self.job_state == SendJobState::Completed
+            && self.stream_closed && self.external.accepted > 0
+            && self.external.rejected == 0 && self.external.timed_out == 0
+            && self.own.rejected == 0 && self.own.timed_out == 0
+            && self.external.error_codes.is_empty() && self.external.error_codes_overflow == 0
+            && self.own.error_codes.is_empty() && self.own.error_codes_overflow == 0
+            && self.unexpected_results == 0 && self.lagged_results == 0
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -272,6 +365,111 @@ pub fn operation_path(work_dir: &Path, id: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn accepted_job() -> SendDiagnostics {
+        let mut summary = SendDiagnostics { job_state: SendJobState::Completed, stream_closed: true,
+            ..SendDiagnostics::default() };
+        summary.record(TargetScope::External, TargetOutcome::Accepted);
+        summary
+    }
+
+    #[test]
+    fn completed_job_requires_an_external_ack_and_complete_result_stream() {
+        assert!(!SendDiagnostics::default().submitted());
+        let complete = SendDiagnostics { job_state: SendJobState::Completed, stream_closed: true,
+            ..SendDiagnostics::default() };
+        assert!(!complete.submitted());
+        let mut own_only = complete;
+        own_only.record(TargetScope::Own, TargetOutcome::Accepted);
+        assert!(!own_only.submitted());
+        let acknowledged = accepted_job();
+        assert!(acknowledged.submitted());
+        assert_eq!(acknowledged.external.accepted, 1);
+        assert_eq!(acknowledged.own.accepted, 0);
+    }
+
+    #[test]
+    fn explicit_target_errors_or_missing_results_override_successful_job_completion() {
+        for scope in [TargetScope::External, TargetScope::Own] {
+            for result in [TargetOutcome::Rejected(5001), TargetOutcome::TimedOut] {
+                let mut summary = accepted_job();
+                summary.record(scope, result);
+                assert!(!summary.submitted());
+            }
+        }
+        let mut unexpected = accepted_job();
+        unexpected.record(TargetScope::Unexpected, TargetOutcome::Accepted);
+        assert_eq!(unexpected.unexpected_results, 1);
+        assert!(!unexpected.submitted());
+        let mut lagged = accepted_job();
+        lagged.lagged_results = 1;
+        assert!(!lagged.submitted());
+        let mut incomplete = accepted_job();
+        incomplete.stream_closed = false;
+        assert!(!incomplete.submitted());
+        for state in [SendJobState::AwaitingClient, SendJobState::ClientFailed, SendJobState::ClientTimedOut,
+            SendJobState::Failed, SendJobState::TimedOut] {
+            let mut summary = accepted_job();
+            summary.job_state = state;
+            assert!(!summary.submitted());
+        }
+    }
+
+    #[test]
+    fn diagnostics_serialize_only_counts_numeric_codes_and_static_job_state() {
+        let mut summary = accepted_job();
+        summary.record(TargetScope::Own, TargetOutcome::Rejected(5001));
+        let value = serde_json::to_value(&summary).unwrap();
+        assert_eq!(value["job_state"], "completed");
+        assert_eq!(value["external"]["accepted"], 1);
+        assert_eq!(value["own"]["rejected"], 1);
+        assert_eq!(value["own"]["error_codes"]["5001"], 1);
+        assert_eq!(serde_json::from_value::<SendDiagnostics>(value).unwrap(), summary);
+    }
+
+    #[test]
+    fn numeric_error_counts_are_bounded_per_scope_and_preserve_signed_provider_codes() {
+        let mut summary = accepted_job();
+        for code in 0..MAX_DIAGNOSTIC_ERROR_CODES as i64 {
+            summary.record(TargetScope::External, TargetOutcome::Rejected(code));
+        }
+        summary.record(TargetScope::External, TargetOutcome::Rejected(0));
+        for _ in 0..3 {
+            summary.record(TargetScope::External, TargetOutcome::Rejected(1000));
+        }
+        assert_eq!(summary.external.error_codes.len(), MAX_DIAGNOSTIC_ERROR_CODES);
+        assert_eq!(summary.external.error_codes.get(&0), Some(&2));
+        assert!(!summary.external.error_codes.contains_key(&1000));
+        assert_eq!(summary.external.error_codes_overflow, 3);
+        assert_eq!(summary.external.rejected, MAX_DIAGNOSTIC_ERROR_CODES as u64 + 4);
+        for code in [-1, i64::MIN, i64::MAX] {
+            summary.record(TargetScope::Own, TargetOutcome::Rejected(code));
+            assert_eq!(summary.own.error_codes.get(&code), Some(&1));
+        }
+        assert_eq!(summary.own.error_codes.len(), 3);
+        assert_eq!(summary.own.error_codes_overflow, 0);
+        assert!(!summary.submitted());
+        let encoded = serde_json::to_string(&summary).unwrap();
+        assert!(!encoded.contains("participant"));
+        assert!(!encoded.contains("token"));
+        assert!(!encoded.contains("status_str"));
+        assert_eq!(serde_json::from_str::<SendDiagnostics>(&encoded).unwrap(), summary);
+    }
+
+    #[test]
+    fn earlier_diagnostics_without_numeric_code_counts_remain_readable() {
+        let mut value = serde_json::to_value(accepted_job()).unwrap();
+        for scope in ["external", "own"] {
+            let fields = value[scope].as_object_mut().unwrap();
+            fields.remove("error_codes");
+            fields.remove("error_codes_overflow");
+        }
+        let decoded: SendDiagnostics = serde_json::from_value(value).unwrap();
+        assert!(decoded.external.error_codes.is_empty());
+        assert_eq!(decoded.external.error_codes_overflow, 0);
+        assert!(decoded.own.error_codes.is_empty());
+        assert_eq!(decoded.own.error_codes_overflow, 0);
+    }
 
     fn xml(value: &plist::Value) -> String {
         let mut bytes = Vec::new();

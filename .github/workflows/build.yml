@@ -1,55 +1,211 @@
-on: [ push, pull_request ]
-name: Build
+# Modified 2026-10-28 for OrdinaryPlace Buddy. SSPL v1; see LICENSE.
+name: Buddy Linux build
+
+"on":
+  push:
+    branches: ["buddy/**"]
+  pull_request:
+    branches: ["buddy/native-polls"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
 jobs:
-  build:
-    strategy:
-      matrix:
-        os: [ ubuntu-latest, macos-latest ]
-        features:
-          - macos-validation-data,remote-clearadi
-          - macos-validation-data,remote-anisette-v3
-      fail-fast: false
-    name: ${{ matrix.os }} with ${{ matrix.features }}
-    runs-on: ${{ matrix.os }}
+  linux:
+    name: Debian 12 worker and poll codec
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      BUDDY_CI_IMAGE: buddy-linux-builder:${{ github.run_id }}-${{ github.run_attempt }}
+      BUDDY_CI_CONTAINER: buddy-linux-builder-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out public source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          submodules: recursive
+          persist-credentials: false
+          submodules: false
 
-      - name: Install Protobuf compiler
+      - name: Initialize pinned public submodules over HTTPS
+        env:
+          GIT_TERMINAL_PROMPT: "0"
         run: |
-          if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-              sudo apt-get install -y protobuf-compiler
-          elif [[ "$OSTYPE" == "darwin"* ]]; then
-              brew install protobuf
+          set -euo pipefail
+          git -c 'url.https://github.com/.insteadOf=git@github.com:' \
+            submodule update --init --recursive -- \
+            third_party/apple-private-apis third_party/quinn third_party/rtc \
+            third_party/rustls third_party/rustls-platform-verifier
+          mkdir -p "$RUNNER_TEMP/buddy-target" "$RUNNER_TEMP/buddy-artifact"
+          git submodule status --recursive -- \
+            third_party/apple-private-apis third_party/quinn third_party/rtc \
+            third_party/rustls third_party/rustls-platform-verifier \
+            > "$RUNNER_TEMP/buddy-artifact/submodules.txt"
+
+      - name: Build the pinned Debian 12 toolchain image
+        run: |
+          set -euo pipefail
+          # No source, credentials, or account inputs enter the image build context.
+          docker build --platform linux/amd64 --tag "$BUDDY_CI_IMAGE" - \
+            < tools/buddy-imessage/ci-build.Dockerfile
+
+      - name: Build worker and fetch both locked dependency graphs
+        run: |
+          set -euo pipefail
+          docker run --detach --name "$BUDDY_CI_CONTAINER" \
+            --platform linux/amd64 --network bridge \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/src" \
+            --mount "type=bind,src=$RUNNER_TEMP/buddy-target,dst=/target" \
+            --mount "type=bind,src=$RUNNER_TEMP/buddy-artifact,dst=/out" \
+            "$BUDDY_CI_IMAGE" sleep infinity
+          docker exec "$BUDDY_CI_CONTAINER" sh -ec '
+            python3 third_party/open-absinthe-linux/tools/prepare_compile_inputs.py
+            cargo fetch --locked --manifest-path tools/buddy-imessage/Cargo.toml
+            cargo fetch --locked --manifest-path tools/poll-codec/Cargo.toml
+            CARGO_TARGET_DIR=/target/worker \
+              cargo build --locked --manifest-path tools/buddy-imessage/Cargo.toml
+          '
+
+      - name: Disconnect builder networking
+        run: |
+          set -euo pipefail
+          docker network disconnect bridge "$BUDDY_CI_CONTAINER"
+          networks=$(docker inspect --format '{{json .NetworkSettings.Networks}}' "$BUDDY_CI_CONTAINER")
+          test "$networks" = '{}'
+
+      - name: Test worker and codec with no network
+        run: |
+          set -euo pipefail
+          docker exec "$BUDDY_CI_CONTAINER" sh -ec '
+            CARGO_TARGET_DIR=/target/worker \
+              cargo test --locked --offline --manifest-path tools/buddy-imessage/Cargo.toml
+            CARGO_TARGET_DIR=/target/codec \
+              cargo test --locked --offline --manifest-path tools/poll-codec/Cargo.toml
+          '
+
+      - name: Export ELF, licenses, provenance and checksums
+        run: |
+          set -euo pipefail
+          docker exec "$BUDDY_CI_CONTAINER" sh -ec '
+            CARGO_TARGET_DIR=/target/worker cargo metadata --locked --offline --format-version 1 \
+              --manifest-path tools/buddy-imessage/Cargo.toml > /target/worker-metadata.json
+            rustc -vV > /out/toolchain.txt
+            cargo -V >> /out/toolchain.txt
+            gcc --version | head -n 1 >> /out/toolchain.txt
+            protoc --version >> /out/toolchain.txt
+            dpkg-query -W build-essential cmake ninja-build pkg-config libclang-dev \
+              protobuf-compiler perl python3 git ca-certificates binutils file \
+              > /out/debian-build-packages.txt
+          '
+          docker exec -i \
+            --env BUDDY_SOURCE_SHA="$GITHUB_SHA" \
+            --env BUDDY_SOURCE_REF="$GITHUB_REF" \
+            --env BUDDY_SOURCE_REPOSITORY="$GITHUB_REPOSITORY" \
+            "$BUDDY_CI_CONTAINER" python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import subprocess
+
+          out = Path('/out')
+          executable = Path('/target/worker/debug/buddy-imessage')
+          with executable.open('rb') as stream:
+              header = stream.read(20)
+          assert header[:4] == b'\x7fELF' and header[4:6] == b'\x02\x01', 'Expected ELF64 little endian'
+          assert int.from_bytes(header[18:20], 'little') == 62, 'Expected x86-64'
+          libc = subprocess.check_output(['getconf', 'GNU_LIBC_VERSION'], text=True).strip()
+          assert libc == 'glibc 2.36', libc
+          abi = subprocess.check_output(['readelf', '--version-info', str(executable)], text=True)
+          versions = {tuple(map(int, value.split('.'))) for value in re.findall(r'GLIBC_([0-9.]+)', abi)}
+          assert versions and max(versions) <= (2, 36), 'Requires newer glibc than Debian 12'
+          linkage = subprocess.check_output(['ldd', str(executable)], text=True)
+          assert 'not found' not in linkage, linkage
+          (out / 'ELF-ABI.txt').write_text(
+              subprocess.check_output(['file', str(executable)], text=True) + linkage + abi)
+          shutil.copy2(executable, out / 'buddy-imessage')
+          for name in ['LICENSE', 'LICENSE.exceptions']:
+              shutil.copyfile(Path('/src') / name, out / name)
+          nac = Path('/src/third_party/open-absinthe-linux')
+          provenance = out / 'provenance'
+          provenance.mkdir()
+          for name in ['LICENSE', 'SOURCE.json', 'PROVENANCE.md', 'BUILDING.md']:
+              shutil.copyfile(nac / name, provenance / name)
+
+          packages = json.loads(Path('/target/worker-metadata.json').read_text())['packages']
+          license_metadata = []
+          public_roots = [Path('/src'), Path('/usr/local/cargo/registry'), Path('/usr/local/cargo/git')]
+          for package in packages:
+              package_root = Path(package['manifest_path']).parent
+              candidates = set()
+              for directory in [package_root, package_root.parent]:
+                  for pattern in ['LICENSE*', 'COPYING*', 'NOTICE*']:
+                      candidates.update(directory.glob(pattern))
+              if package.get('license_file'):
+                  candidates.add(package_root / package['license_file'])
+              copied = []
+              for path in sorted(candidates):
+                  resolved = path.resolve()
+                  if not any(resolved.is_relative_to(root) for root in public_roots):
+                      continue
+                  if not resolved.is_file() or resolved.stat().st_size > 1024 * 1024:
+                      continue
+                  content = resolved.read_bytes()
+                  try:
+                      content.decode('utf-8')
+                  except UnicodeDecodeError:
+                      continue
+                  digest = hashlib.sha256(content).hexdigest()
+                  destination = out / 'licenses' / (package['name'] + '-' + package['version'])
+                  destination.mkdir(parents=True, exist_ok=True)
+                  filename = re.sub(r'[^A-Za-z0-9_.-]', '_', path.name) + '-' + digest[:12] + '.txt'
+                  (destination / filename).write_bytes(content)
+                  copied.append(str((destination / filename).relative_to(out)))
+              license_metadata.append(
+                  {key: package.get(key) for key in ['name', 'version', 'license', 'source', 'repository']}
+                  | {'files': copied})
+          (out / 'dependency-licenses.json').write_text(json.dumps(license_metadata, indent=2) + '\n')
+          metadata = {
+              'repository': os.environ['BUDDY_SOURCE_REPOSITORY'],
+              'commit': os.environ['BUDDY_SOURCE_SHA'],
+              'ref': os.environ['BUDDY_SOURCE_REF'],
+              'target': 'x86_64-unknown-linux-gnu',
+              'builder_base': 'rust:1.90.0-slim-bookworm@sha256:64232e656c058f4468e8d024e990acff04f0fd5a5c0a88a574dc37773d7325c9',
+              'rust_toolchain': '1.99.1',
+              'profile': 'dev, debug=0',
+              'builder_libc': libc,
+              'maximum_required_glibc': '.'.join(map(str, max(versions))),
+              'tests': ['locked offline worker tests', 'locked offline standalone poll-codec tests'],
+              'test_networks': {},
+              'account_state_or_runtime_apple_binary_supplied': False,
+          }
+          (out / 'build-metadata.json').write_text(json.dumps(metadata, indent=2) + '\n')
+          (out / 'README.txt').write_text(
+              'Linux/amd64 Buddy worker; source commit and ABI are in build-metadata.json.\n'
+              'Verify SHA256SUMS, then chmod 0755 buddy-imessage after artifact download.\n'
+              'No account export, account private key, hardware identity, ChatGPT credentials or Apple runtime resource is included.\n')
+          entries = []
+          for path in sorted(out.rglob('*')):
+              if path.is_file() and path.name != 'SHA256SUMS':
+                  entries.append(hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + str(path.relative_to(out)))
+          (out / 'SHA256SUMS').write_text('\n'.join(entries) + '\n')
+          print('Exported verified Linux/amd64 ELF and public license/provenance files.')
+          print(hashlib.sha256(executable.read_bytes()).hexdigest() + '  buddy-imessage')
+          PY
+
+      - name: Upload tested Linux artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: buddy-linux-amd64-${{ github.sha }}
+          path: ${{ runner.temp }}/buddy-artifact/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
+
+      - name: Remove this job's builder container
+        if: always()
+        run: |
+          if docker container inspect "$BUDDY_CI_CONTAINER" >/dev/null 2>&1; then
+            docker rm --force "$BUDDY_CI_CONTAINER"
           fi
-
-      - name: Set up fake Fairplay keys
-        run: |
-          mkdir -p certs/fairplay
-
-          cert_names=(
-            "4056631661436364584235346952193"
-            "4056631661436364584235346952194"
-            "4056631661436364584235346952195"
-            "4056631661436364584235346952196"
-            "4056631661436364584235346952197"
-            "4056631661436364584235346952198"
-            "4056631661436364584235346952199"
-            "4056631661436364584235346952200"
-            "4056631661436364584235346952201"
-            "4056631661436364584235346952208"
-          )
-
-          for name in "${cert_names[@]}"; do
-              cp certs/legacy-fairplay/fairplay.pem certs/fairplay/$name.pem
-              cp certs/legacy-fairplay/fairplay.crt certs/fairplay/$name.crt
-          done
-
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-      - uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --release --features '${{ matrix.features }}' --package rustpush --lib

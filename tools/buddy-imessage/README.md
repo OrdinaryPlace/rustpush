@@ -1,6 +1,6 @@
 # Buddy Linux iMessage worker
 
-Modified 2026-10-27. This crate is part of the SSPL-licensed protocol fork. It uses
+Modified 2026-10-28. This crate is part of the SSPL-licensed protocol fork. It uses
 the real rustpush messaging APIs and native Polls helpers without a Mac runtime.
 It does not provide Apple sign-in; a dedicated Linux login helper remains a
 separate provisioning step.
@@ -122,10 +122,51 @@ to SMS. A stored `dispatching` record after a process crash also requires
 reconciliation; it is not permission to send again. The underlying protocol may
 retransmit within one send job using the same message identity.
 
-`submitted` means the protocol send job completed, not that someone saw the
-message. Native delivery/read receipts are emitted as inbound evidence; phone
-observation remains a separate check. Operation records and `status` responses
-include GUIDs and poll metadata, not private keys or credentials.
+Send timeouts bound observation, not all underlying network activity. The
+upstream client can leave its same-GUID send job running after the worker stops
+awaiting it; that job may continue its own retries until worker/connection
+shutdown. A timeout's diagnostic snapshot can therefore be incomplete. The
+worker never treats that timeout as permission for an outer resend, and it
+does not claim that returning `uncertain` has aborted every in-flight send.
+
+New dispatches collect the typed `SendJob.process` results while awaiting the
+job, then drain at most 4096 remaining results. `send_diagnostics` is persisted
+with the final operation and returned by `status`:
+
+```text
+version: 1
+job_state: awaiting_client | client_failed | client_timed_out | completed | failed | timed_out
+external: {accepted, rejected, timed_out, error_codes, error_codes_overflow}
+own: {accepted, rejected, timed_out, error_codes, error_codes_overflow}
+unexpected_results: count
+lagged_results: count
+stream_closed: boolean
+```
+
+These are per-target result counts; `accepted` means the transport/service
+acknowledgement represented by the library's `SendResult::Sent`. They do not
+prove delivery to Messages, native rendering, reading or a user's vote. No
+device token, participant handle, key or free-form error text is included in
+these diagnostic fields. Each scope retains counts for at most 64 distinct
+numeric `SendResult::APSError` codes. Codes preserve the API's signed integer
+type (JSON object keys encode those integers as decimal strings). Further
+results with unretained codes increment `error_codes_overflow`; repeated
+retained codes continue to increment their existing count. A dropped/lagged
+stream cannot be reconstructed. A
+failure or timeout before the library returns a job also leaves its per-target
+results unknown. An empty-but-open stream or a drain that reaches its bound is
+incomplete, not a successful result.
+
+For new dispatches, `submitted` requires a completed job, at least one external
+accepted result, a closed result stream, and no own/external rejection,
+timeout, unexpected target or lost result. Any such error or incomplete result
+is `uncertain`, even if the library job returned `Ok(())`. There is no automatic
+retry. Older operation files load with `send_diagnostics:null`; their original
+status and identity are retained, and no new evidence is inferred from them.
+Operation replies include `delivery_verified:false`. Native delivery/read
+receipts are emitted as separate inbound evidence; phone observation remains
+a separate check. Operation records and `status` responses include GUIDs and
+poll metadata, not private keys or credentials.
 
 ## Inbound events
 
@@ -133,6 +174,19 @@ include GUIDs and poll metadata, not private keys or credentials.
 `from_me` and `verification_failed`. Kinds include `text`, `poll`, `poll_vote`,
 receipts, reactions and explicit unsupported content. Native polls expose their
 typed JSON plus original poll GUID/part/session before flattening can discard it.
+Every message also has a static `message_type` variant category. Unsupported
+events can therefore distinguish typing, profile updates, cache invalidation
+and other protocol events without serializing their bodies. A typed
+`Message::Error` emits `event:"message", kind:"error", message_type:"error"`,
+numeric `status`, and `error_for_message_id` as a canonical UUID or null. This
+target comes only from `ErrorMessage.for_uuid`; the error event's own wrapper
+GUID is never substituted as the failed message. Remote `status_str` and other
+free-form protocol error text are omitted. `error_category` is the static
+`message_protection_802` only for an exact remote
+`ec-com.apple.messageprotection-802` match (the source client already handles
+that code by invalidating its key cache); all other strings become `unknown`.
+These events remain diagnostic
+evidence; they cannot authorize an action or a resend.
 The JSON payload's creator/participant handle is an untrusted claim: authenticate
 against the transport sender and verified aliases, correlate the original poll
 and session, and validate option IDs before counting a vote. Do not act on

@@ -1,4 +1,4 @@
-// Modified 2026-10-27 for OrdinaryPlace Buddy. SSPL v1; see repository LICENSE.
+// Modified 2026-10-28 for OrdinaryPlace Buddy. SSPL v1; see repository LICENSE.
 // Default startup is offline. Only an explicit JSONL connect command contacts Apple.
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use buddy_imessage::*;
 use keystore::{init_keystore, software::{NoEncryptor, SoftwareKeystore, SoftwareKeystoreState}};
 use rustpush::{APSConnection, APSConnectionResource, APSState, IDSNGMIdentity, IDSUser,
-    IMClient, MADRID_SERVICE, Message, MessageInst, MessageType, NormalMessage, OSConfig};
+    IMClient, MADRID_SERVICE, Message, MessageInst, MessageType, NormalMessage, OSConfig, SendJob, SendResult};
 use rustpush::polls::{NativePollPayload, PollPayload};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -33,6 +33,8 @@ struct Operation {
     // typed JSON payload separately and rebuild the SAME session/options on load.
     poll_payload: Option<PollPayload>,
     status: String,
+    #[serde(default)]
+    send_diagnostics: Option<SendDiagnostics>,
 }
 
 struct Connected {
@@ -104,7 +106,8 @@ fn load_operation(directory: &Path, id: &str) -> Result<Operation> {
 
 fn report_operation(operation: &Operation, request_id: &str) -> Value {
     json!({"event":"operation","id":operation.id,"request_id":request_id,"message_guid":operation.message.id,
-        "status":operation.status,"poll":operation.poll,"automatic_retry":false})
+        "status":operation.status,"poll":operation.poll,"automatic_retry":false,
+        "send_diagnostics":operation.send_diagnostics,"delivery_verified":false})
 }
 
 fn error_event(request_id: Option<&str>, error: WorkerError) -> Value {
@@ -113,6 +116,66 @@ fn error_event(request_id: Option<&str>, error: WorkerError) -> Value {
 
 async fn emit(output: &mpsc::Sender<Value>, event: Value) {
     let _ = output.send(event).await;
+}
+
+fn record_send_result(diagnostics: &mut SendDiagnostics, participant: &str, result: SendResult,
+    own_handles: &[String], expected_participants: &[String]) {
+    let scope = if own_handles.iter().any(|own| own == participant) { TargetScope::Own }
+        else if expected_participants.iter().any(|expected| expected == participant) { TargetScope::External }
+        else { TargetScope::Unexpected };
+    let outcome = match result {
+        SendResult::Sent => TargetOutcome::Accepted,
+        SendResult::APSError(code) => TargetOutcome::Rejected(code),
+        SendResult::TimedOut => TargetOutcome::TimedOut,
+    };
+    diagnostics.record(scope, outcome);
+}
+
+async fn observe_send_job(mut job: SendJob, own_handles: &[String], expected_participants: &[String],
+    timeout: Duration) -> SendDiagnostics {
+    let mut diagnostics = SendDiagnostics::default();
+    if let Some(handle) = job.handle.take() {
+        let completion = tokio::time::timeout(timeout, handle);
+        tokio::pin!(completion);
+        loop {
+            tokio::select! {
+                finished = &mut completion => {
+                    diagnostics.job_state = match finished {
+                        Ok(Ok(Ok(()))) => SendJobState::Completed,
+                        Ok(_) => SendJobState::Failed,
+                        Err(_) => SendJobState::TimedOut,
+                    };
+                    break;
+                },
+                result = job.process.recv(), if !diagnostics.stream_closed => match result {
+                    Ok((target, result)) => record_send_result(&mut diagnostics, &target.participant,
+                        result, own_handles, expected_participants),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                        diagnostics.lagged_results = diagnostics.lagged_results.saturating_add(count);
+                    },
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => diagnostics.stream_closed = true,
+                },
+            }
+        }
+    } else {
+        // None also represents a job completed inside send_message. Its queued
+        // results must still be read; None alone is not an acknowledgement.
+        diagnostics.job_state = SendJobState::Completed;
+    }
+    // The producer normally closes on completion. An empty-but-open stream is
+    // incomplete, so classification remains uncertain without waiting forever.
+    for _ in 0..4096 {
+        match job.process.try_recv() {
+            Ok((target, result)) => record_send_result(&mut diagnostics, &target.participant,
+                result, own_handles, expected_participants),
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(count)) => {
+                diagnostics.lagged_results = diagnostics.lagged_results.saturating_add(count);
+            },
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => { diagnostics.stream_closed = true; break; },
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+        }
+    }
+    diagnostics
 }
 
 impl Worker {
@@ -281,7 +344,7 @@ impl Worker {
         // keep this generated conversation GUID and the MessageInst GUID.
         message.prepare_send(&[bundle.preferred_handle]);
         let operation = Operation { version: 1, id: id.clone(), fingerprint: digest,
-            message, poll: metadata, poll_payload, status: "prepared".into() };
+            message, poll: metadata, poll_payload, status: "prepared".into(), send_diagnostics: None };
         save_operation(&self.work_dir, &operation)?;
         self.operations.lock().map_err(|_| WorkerError("operation_state_failed"))?.insert(id.clone(), operation.clone());
         Ok(operation)
@@ -290,7 +353,8 @@ impl Worker {
     async fn dispatch(&mut self, operation_id: &str) -> Result<Operation> {
         let connected = self.connected.as_ref().ok_or(WorkerError("not_connected"))?;
         if self.persistence_failed.load(Ordering::SeqCst) { return Err(WorkerError("state_persist_failed")); }
-        if !connected.client.identity.get_handles().await.contains(&connected.actor) {
+        let own_handles = connected.client.identity.get_handles().await;
+        if !own_handles.contains(&connected.actor) {
             return Err(WorkerError("own_identity_changed"));
         }
         let mut operation = load_operation(&self.work_dir, operation_id)?;
@@ -302,25 +366,23 @@ impl Worker {
         let conversation = operation.message.conversation.as_ref().ok_or(WorkerError("invalid_operation_record"))?;
         Conversation { participants: conversation.participants.clone(), sender_guid: conversation.sender_guid.clone(),
             cv_name: conversation.cv_name.clone(), after_guid: conversation.after_guid.clone() }.validate(&connected.actor)?;
+        let expected_participants = conversation.participants.clone();
         if !matches!(&operation.message.message, Message::Message(normal) if normal.service == MessageType::IMessage) {
             return Err(WorkerError("unsupported_operation_message"));
         }
         operation.status = "dispatching".into();
+        operation.send_diagnostics = Some(SendDiagnostics::default());
         save_operation(&self.work_dir, &operation)?;
         let result = tokio::time::timeout(Duration::from_secs(60), connected.client.send(&mut operation.message)).await;
-        let outcome = match result {
-            Ok(Ok(mut job)) => match job.handle.take() {
-                Some(handle) => match tokio::time::timeout(Duration::from_secs(150), handle).await {
-                    Ok(Ok(Ok(()))) => "submitted",
-                    _ => "uncertain",
-                },
-                None => "submitted",
-            },
-            // Once dispatch starts, errors/timeouts are conservatively uncertain.
-            // Do not replace the GUID, fall back to SMS, or automatically retry.
-            _ => "uncertain",
+        let diagnostics = match result {
+            Ok(Ok(job)) => observe_send_job(job, &own_handles, &expected_participants, Duration::from_secs(150)).await,
+            Ok(Err(_)) => SendDiagnostics { job_state: SendJobState::ClientFailed, ..SendDiagnostics::default() },
+            Err(_) => SendDiagnostics { job_state: SendJobState::ClientTimedOut, ..SendDiagnostics::default() },
         };
-        operation.status = outcome.into();
+        // Explicit errors, timeouts and incomplete streams remain uncertain even
+        // if the producer returned Ok. Never resend or replace the native GUID.
+        operation.status = if diagnostics.submitted() { "submitted" } else { "uncertain" }.into();
+        operation.send_diagnostics = Some(diagnostics);
         save_operation(&self.work_dir, &operation)?;
         self.operations.lock().map_err(|_| WorkerError("operation_state_failed"))?
             .insert(operation.id.clone(), operation.clone());
@@ -364,13 +426,46 @@ fn epoch_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
-async fn emit_inbound(output: &mpsc::Sender<Value>, handles: &[String], message: MessageInst, connected_at_ms: u64) {
+fn message_type(message: &Message) -> &'static str {
+    match message {
+        Message::Message(_) => "message",
+        Message::RenameMessage(_) => "rename",
+        Message::ChangeParticipants(_) => "change_participants",
+        Message::React(_) => "reaction",
+        Message::Delivered => "delivery_receipt",
+        Message::Read => "read_receipt",
+        Message::Typing(_, _) => "typing",
+        Message::Unsend(_) => "unsend",
+        Message::Edit(_) => "edit",
+        Message::IconChange(_) => "icon_change",
+        Message::EnableSmsActivation(_) => "enable_sms_activation",
+        Message::MessageReadOnDevice => "message_read_on_device",
+        Message::SmsConfirmSent(_) => "sms_confirm_sent",
+        Message::MarkUnread => "mark_unread",
+        Message::PeerCacheInvalidate => "peer_cache_invalidate",
+        Message::UpdateExtension(_) => "update_extension",
+        Message::Error(_) => "error",
+        Message::MoveToRecycleBin(_) => "move_to_recycle_bin",
+        Message::RecoverChat(_) => "recover_chat",
+        Message::PermanentDelete(_) => "permanent_delete",
+        Message::Unschedule => "unschedule",
+        Message::UpdateProfile(_) => "update_profile",
+        Message::UpdateProfileSharing(_) => "update_profile_sharing",
+        Message::ShareProfile(_) => "share_profile",
+        Message::NotifyAnyways => "notify_anyways",
+        Message::SetTranscriptBackground(_) => "set_transcript_background",
+        Message::RecoverProfile => "recover_profile",
+    }
+}
+
+fn inbound_event(handles: &[String], message: MessageInst, connected_at_ms: u64, received_at_ms: u64) -> Value {
     let conversation = message.conversation.as_ref().map(|c| json!({"participants":c.participants,
         "sender_guid":c.sender_guid,"cv_name":c.cv_name,"after_guid":c.after_guid}));
     let mut event = json!({"event":"message","message_id":message.id,"sender":message.sender,
+        "message_type":message_type(&message.message),
         "from_me":message.sender.as_ref().is_some_and(|sender| handles.contains(sender)),
-        "timestamp_ms":message.sent_timestamp,"received_at_ms":epoch_ms(),
-        "initial_connection_window":epoch_ms().saturating_sub(connected_at_ms) < 30_000,
+        "timestamp_ms":message.sent_timestamp,"received_at_ms":received_at_ms,
+        "initial_connection_window":received_at_ms.saturating_sub(connected_at_ms) < 30_000,
         "verification_failed":message.verification_failed,
         "conversation":conversation});
     match message.native_poll_event() {
@@ -399,10 +494,23 @@ async fn emit_inbound(output: &mpsc::Sender<Value>, handles: &[String], message:
             Message::Delivered => { event["kind"] = json!("delivery_receipt"); }
             Message::Read => { event["kind"] = json!("read_receipt"); }
             Message::React(_) => { event["kind"] = json!("reaction"); }
+            Message::Error(error) => {
+                event["kind"] = json!("error");
+                event["status"] = json!(error.status);
+                event["error_category"] = json!(if error.status_str == "ec-com.apple.messageprotection-802" {
+                    "message_protection_802"
+                } else { "unknown" });
+                event["error_for_message_id"] = json!(uuid::Uuid::parse_str(&error.for_uuid).ok()
+                    .map(|guid| guid.to_string().to_uppercase()));
+            }
             _ => { event["kind"] = json!("unsupported"); }
         },
     }
-    emit(output, event).await;
+    event
+}
+
+async fn emit_inbound(output: &mpsc::Sender<Value>, handles: &[String], message: MessageInst, connected_at_ms: u64) {
+    emit(output, inbound_event(handles, message, connected_at_ms, epoch_ms())).await;
 }
 
 async fn bounded_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Option<Vec<u8>>> {
@@ -627,5 +735,126 @@ mod tests {
         assert_eq!(error["id"], "fresh-dispatch-query");
         assert_eq!(error["code"], "not_connected");
         assert_eq!(error_event(None, WorkerError("invalid_command"))["request_id"], Value::Null);
+    }
+
+    #[test]
+    fn protocol_error_uses_typed_target_and_numeric_status_without_remote_text() {
+        let Command::PreparePoll { conversation, .. } = poll_command() else { panic!("Expected poll command") };
+        let target = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut message = MessageInst::new(conversation.protocol(), "mailto:family@example.test",
+            Message::Error(rustpush::ErrorMessage { for_uuid: target.into(), status: 802,
+                status_str: "REMOTE_TEXT_MUST_NEVER_BE_EMITTED".into() }));
+        message.id = "BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB".into();
+        message.conversation = None;
+        let wrapper = message.id.clone();
+        let event = inbound_event(&[], message, 0, 31_000);
+        assert_eq!(event["kind"], "error");
+        assert_eq!(event["message_type"], "error");
+        assert_eq!(event["status"], 802);
+        assert_eq!(event["error_category"], "unknown");
+        assert_eq!(event["message_id"], wrapper);
+        assert_eq!(event["error_for_message_id"], target.to_uppercase());
+        assert_ne!(event["error_for_message_id"], event["message_id"]);
+        assert!(!serde_json::to_string(&event).unwrap().contains("REMOTE_TEXT"));
+        assert!(event.get("status_str").is_none());
+    }
+
+    #[test]
+    fn malformed_error_target_never_becomes_the_wrapper_id_or_echoes_source_text() {
+        let Command::PreparePoll { conversation, .. } = poll_command() else { panic!("Expected poll command") };
+        let message = MessageInst::new(conversation.protocol(), "mailto:family@example.test",
+            Message::Error(rustpush::ErrorMessage { for_uuid: "INVALID_TARGET_MUST_NOT_LEAK".into(),
+                status: 1, status_str: "REMOTE_TEXT_MUST_NOT_LEAK".into() }));
+        let event = inbound_event(&[], message, 0, 31_000);
+        assert_eq!(event["error_for_message_id"], Value::Null);
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert!(!encoded.contains("MUST_NOT_LEAK"));
+    }
+
+    #[test]
+    fn protocol_error_category_is_an_exact_allowlist_and_never_echoes_remote_text() {
+        let Command::PreparePoll { conversation, .. } = poll_command() else { panic!("Expected poll command") };
+        for (remote, category) in [
+            ("ec-com.apple.messageprotection-802", "message_protection_802"),
+            ("ec-com.apple.messageprotection-802-extra", "unknown"),
+            ("ec-com.apple.messageprotection-802\n", "unknown"),
+            ("REMOTE_TOKEN_MUST_NEVER_LEAK", "unknown"),
+        ] {
+            let message = MessageInst::new(conversation.protocol(), "mailto:family@example.test",
+                Message::Error(rustpush::ErrorMessage { for_uuid: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA".into(),
+                    status: 1, status_str: remote.into() }));
+            let event = inbound_event(&[], message, 0, 31_000);
+            assert_eq!(event["error_category"], category);
+            assert!(!serde_json::to_string(&event).unwrap().contains(remote));
+            assert!(event.get("status_str").is_none());
+        }
+    }
+
+    #[test]
+    fn unsupported_message_exposes_only_static_variant_category() {
+        let Command::PreparePoll { conversation, .. } = poll_command() else { panic!("Expected poll command") };
+        let message = MessageInst::new(conversation.protocol(), "mailto:family@example.test", Message::Typing(false, None));
+        let event = inbound_event(&[], message, 0, 31_000);
+        assert_eq!(event["kind"], "unsupported");
+        assert_eq!(event["message_type"], "typing");
+        assert!(event.get("text").is_none());
+        assert!(event.get("payload").is_none());
+    }
+
+    #[test]
+    fn typed_send_results_preserve_numeric_codes_without_serializing_participants() {
+        let own: Vec<String> = vec!["mailto:buddy@example.test".into()];
+        let expected: Vec<String> = vec![own[0].clone(), "mailto:family@example.test".into()];
+        let mut summary = SendDiagnostics::default();
+        record_send_result(&mut summary, &expected[1], SendResult::Sent, &own, &expected);
+        record_send_result(&mut summary, &expected[1], SendResult::APSError(987654321), &own, &expected);
+        record_send_result(&mut summary, &own[0], SendResult::TimedOut, &own, &expected);
+        record_send_result(&mut summary, "mailto:unexpected@example.test", SendResult::Sent, &own, &expected);
+        assert_eq!(summary.external.accepted, 1);
+        assert_eq!(summary.external.rejected, 1);
+        assert_eq!(summary.external.error_codes.get(&987654321), Some(&1));
+        assert_eq!(summary.own.timed_out, 1);
+        assert_eq!(summary.unexpected_results, 1);
+        let encoded = serde_json::to_string(&summary).unwrap();
+        assert!(!encoded.contains("example.test"));
+        assert!(encoded.contains("987654321"));
+        assert!(!summary.submitted());
+    }
+
+    #[tokio::test]
+    async fn completed_job_without_results_is_not_a_positive_acknowledgement() {
+        let (sender, process) = tokio::sync::broadcast::channel(1);
+        drop(sender);
+        let summary = observe_send_job(SendJob { process, handle: None }, &[], &[], Duration::from_secs(1)).await;
+        assert_eq!(summary.job_state, SendJobState::Completed);
+        assert!(summary.stream_closed);
+        assert!(!summary.submitted());
+    }
+
+    #[tokio::test]
+    async fn completed_handle_with_open_result_stream_is_marked_incomplete() {
+        let (sender, process) = tokio::sync::broadcast::channel(1);
+        let handle = tokio::spawn(async { Ok::<(), rustpush::PushError>(()) });
+        let summary = observe_send_job(SendJob { process, handle: Some(handle) }, &[], &[], Duration::from_secs(1)).await;
+        assert_eq!(summary.job_state, SendJobState::Completed);
+        assert!(!summary.stream_closed);
+        assert!(!summary.submitted());
+        drop(sender);
+    }
+
+    #[test]
+    fn legacy_operation_without_diagnostics_keeps_its_identity_and_unknown_evidence() {
+        let directory = PrivateTestDirectory::new();
+        let mut worker = offline_worker(&directory.0);
+        let first = worker.prepare(&poll_command()).unwrap();
+        let mut value = serde_json::to_value(&first).unwrap();
+        value.as_object_mut().unwrap().remove("send_diagnostics");
+        let decoded: Operation = serde_json::from_value(value).unwrap();
+        assert!(decoded.send_diagnostics.is_none());
+        assert_eq!(decoded.message.id, first.message.id);
+        assert_eq!(decoded.fingerprint, first.fingerprint);
+        let response = report_operation(&decoded, "status-query");
+        assert_eq!(response["send_diagnostics"], Value::Null);
+        assert_eq!(response["delivery_verified"], false);
     }
 }
