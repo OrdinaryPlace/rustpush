@@ -1,0 +1,26 @@
+[package]
+name = "open-absinthe"
+description = "NAC (validation data) emulator: drop-in replacement for OpenBubbles' closed open-absinthe"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "SSPL-1.0"
+# Versions are spelled out (not `workspace = true`) because this crate is also
+# built as a path dependency of third_party/rustpush, outside our workspace.
+
+[features]
+# rustpush enables `features = ["serde"]`; serde support is always on.
+serde = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+log = "0.4"
+rand = "0.8"
+sha1 = "0.10"
+# x86 only: the default `arch_all` QEMU build takes ~80 s and fails to link
+# here (undefined `__atomic_*_16`); x86-only builds in ~12 s. See build.rs.
+unicorn-engine = { version = "2.1", default-features = false, features = ["arch_x86"] }
+
+[dev-dependencies]
+plist = "1.7"
+env_logger = "0.11"

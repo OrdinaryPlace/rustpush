@@ -8,6 +8,8 @@
 //! must bind them to the authenticated `MessageInst.sender` and verified aliases
 //! before using them as identities. A decoded vote is not an authenticated vote.
 //! This codec does not construct a balloon, send a message, or tally results.
+//! Actual balloon/message construction and correlated receive extraction live
+//! on `NormalMessage`, `ReactMessage`, and `MessageInst` in `messages.rs`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;

@@ -1,4 +1,5 @@
 use plist::Date;
+// Modified 2026-10-27 for OrdinaryPlace Buddy native polls. SSPL v1; see LICENSE.
 use serde::{Serialize, Deserialize, ser::Serializer};
 use crate::mmcs::MMCSTransferData;
 use crate::util::{NSData, NSUUID, NSURL};
@@ -519,61 +520,8 @@ impl BalloonRawData {
     }
 }
 
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-struct RawBalloonData {
-    ldtext: Option<String>,
-    #[serde(flatten)]
-    layout: Option<BalloonLayout>,
-    #[serde(rename = "an")]
-    app_name: String,
-    #[serde(rename = "ai")]
-    app_icon: Option<BalloonRawData>,
-    session_identifier: Option<NSUUID>,
-    live_layout_info: Option<BalloonRawData>,
-    #[serde(rename = "URL")]
-    url: NSURL,
-    appid: Option<u64>,
-}
-
-impl Serialize for RawBalloonData {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where
-            S: Serializer {
-        let mut dict = Dictionary::from_iter([
-            ("an".to_string(), self.app_name.clone().into()),
-            ("URL".to_string(), plist::to_value(&self.url).map_err(serde::ser::Error::custom)?)
-        ]);
-
-        if let Some(layout) = &self.layout {
-            let serialized = plist::to_value(&layout).map_err(serde::ser::Error::custom)?;
-            let Some(d) = serialized.into_dictionary() else { panic!("not a dictionary!") };
-            dict.extend(d)
-        }
-
-        if let Some(app_icon) = &self.app_icon {
-            dict.insert("ai".to_string(), plist::to_value(&app_icon).map_err(serde::ser::Error::custom)?);
-        }
-
-        if let Some(appid) = &self.appid {
-            dict.insert("appid".to_string(), appid.into());
-        }
-
-        if let Some(ldtext) = &self.ldtext {
-            dict.insert("ldtext".to_string(), ldtext.clone().into());
-        }
-
-        if let Some(session_identifier) = &self.session_identifier {
-            dict.insert("sessionIdentifier".to_string(), plist::to_value(&session_identifier).map_err(serde::ser::Error::custom)?);
-        }
-
-        if let Some(live_layout_info) = &self.live_layout_info {
-            dict.insert("liveLayoutInfo".to_string(), plist::to_value(&live_layout_info).map_err(serde::ser::Error::custom)?);
-        }
-        
-        dict.serialize(serializer)
-    }
-}
+// The production path and isolated tests compile the same dictionary serializer.
+type RawBalloonData = super::balloon_wire::RawBalloonData<BalloonLayout, BalloonRawData, NSUUID, NSURL>;
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]

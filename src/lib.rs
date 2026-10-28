@@ -1,4 +1,5 @@
 
+// Modified 2026-10-27 for OrdinaryPlace Buddy native polls. SSPL v1; see LICENSE.
 mod activation;
 mod aps;
 mod util;
@@ -15,6 +16,7 @@ pub mod statuskit;
 pub mod passwords;
 pub use imessage::cloud_messages;
 pub use imessage::posterkit;
+pub use imessage::polls;
 pub use util::KeyedArchive;
 
 pub use icloud::cloudkit;

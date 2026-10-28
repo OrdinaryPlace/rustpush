@@ -1,5 +1,6 @@
 
 
+// Modified 2026-10-27 for OrdinaryPlace Buddy native polls. SSPL v1; see LICENSE.
 use std::{collections::HashMap, fmt, io::{Cursor, Read, Write}, mem, str::FromStr, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
 
 use log::{debug, error, info, warn};
@@ -187,6 +188,7 @@ impl MessageParts {
     fn is_multipart(&self) -> bool {
         self.0.iter().any(|p| matches!(p.part, MessagePart::Attachment(_)) || 
             matches!(p.part, MessagePart::Mention(_, _)) || 
+            matches!(p.part, MessagePart::Object(_)) ||
             matches!(p.part, MessagePart::Text(_, fmt) if !fmt.is_normal()))
     }
 
@@ -698,6 +700,9 @@ pub struct Balloon {
     pub is_live: bool,
 
     pub icon: Option<Vec<u8>>,
+    // Native Polls uses a keyed-archive capability array and sendAsText marker.
+    pub required_capabilities: Option<Vec<u8>>,
+    pub send_as_text: Option<bool>,
 }
 
 impl Balloon {
@@ -712,7 +717,8 @@ impl Balloon {
     }
 
     fn from_raw(unpacked: RawBalloonData) -> Result<Balloon, PushError> {
-        let uuid: Option<Uuid> = unpacked.session_identifier.map(|i| i.into());
+        let uuid = unpacked.session_identifier.map(|session|
+            Uuid::from_slice(&session).map_err(|_| PushError::BadMsg)).transpose()?;
         Ok(Balloon {
             url: unpacked.url.into(),
             session: uuid.map(|u| u.to_string()),
@@ -720,20 +726,28 @@ impl Balloon {
             ld_text: unpacked.ldtext,
             is_live: unpacked.live_layout_info.is_some(),
             icon: unpacked.app_icon.map(|a| a.decompress().into_bytes()),
+            required_capabilities: unpacked.required_capabilities.map(|a| a.into_bytes()),
+            send_as_text: unpacked.send_as_text,
         })
     }
 
     fn to_raw(&self, app: &ExtensionApp, is_backup: bool) -> Result<Vec<u8>, PushError> {
+        let session_identifier = self.session.as_ref()
+            .map(|session| Uuid::from_str(session).map(|id| id.into()).map_err(|_| PushError::BadMsg))
+            .transpose()?;
         let raw = NSDictionary {
             item: RawBalloonData {
                 ldtext: self.ld_text.clone(),
                 layout: self.layout.clone(),
                 app_icon: self.icon.as_ref().map(|icon| BalloonRawData::new(icon.clone(), is_backup).compress()),
                 app_name: app.name.clone(),
-                session_identifier: self.session.as_ref().map(|session| Uuid::from_str(&session).unwrap().into()),
+                session_identifier,
                 live_layout_info: if self.is_live {
                     Some(BalloonRawData::new(include_bytes!("livelayout.bplist").to_vec(), is_backup))
                 } else { None },
+                required_capabilities: self.required_capabilities.as_ref()
+                    .map(|capabilities| BalloonRawData::new(capabilities.clone(), is_backup)),
+                send_as_text: self.send_as_text,
                 url: NSURL {
                     base: "$null".to_string(),
                     relative: self.url.clone()
@@ -796,6 +810,218 @@ impl NormalMessage {
             scheduled: None,
             embedded_profile: None,
         }
+    }
+}
+
+// Native Polls construction and receive extraction. These helpers operate on
+// real rustpush message types but never resolve recipients or send messages.
+#[derive(Debug)]
+pub enum NativePollError {
+    Codec(super::polls::CodecError),
+    InvalidIdentifier,
+    InvalidEnvelope,
+    WireEncoding,
+}
+
+impl fmt::Display for NativePollError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Codec(error) => fmt::Display::fmt(error, formatter),
+            Self::InvalidIdentifier => formatter.write_str("Invalid native poll identifier"),
+            Self::InvalidEnvelope => formatter.write_str("Invalid native poll message envelope"),
+            Self::WireEncoding => formatter.write_str("Native poll balloon encoding failed"),
+        }
+    }
+}
+
+impl std::error::Error for NativePollError {}
+
+impl From<super::polls::CodecError> for NativePollError {
+    fn from(error: super::polls::CodecError) -> Self { Self::Codec(error) }
+}
+
+#[derive(Clone, Debug)]
+pub struct NativePollMetadata {
+    pub session_id: String,
+    pub option_ids: Vec<String>,
+}
+
+/// Correlated wire event. Payload handles remain untrusted claims; preserve the
+/// transport sender and verification flag separately for the application gate.
+#[derive(Clone)]
+pub struct NativePollEvent {
+    pub transport_message_id: String,
+    pub transport_sender: Option<String>,
+    pub verification_failed: bool,
+    pub conversation: Option<ConversationData>,
+    pub session_id: String,
+    /// The creation's own GUID, or the original poll GUID targeted by a vote.
+    pub poll_message_id: String,
+    pub poll_part: Option<u64>,
+    pub data: super::polls::DecodedDataUrl,
+}
+
+fn check_native_uuid(identifier: &str) -> Result<(), NativePollError> {
+    Uuid::parse_str(identifier).map(|_| ()).map_err(|_| NativePollError::InvalidIdentifier)
+}
+
+fn native_poll_capabilities() -> Result<Vec<u8>, NativePollError> {
+    // Generate the observed capability archive from its semantic contents;
+    // do not embed an Apple image or opaque copied application asset.
+    let capabilities = NSArray {
+        objects: vec!["supports-polls".to_string()],
+        class: NSArrayClass::NSArray,
+    };
+    let value = plist::to_value(&capabilities).map_err(|_| NativePollError::WireEncoding)?;
+    let archive = KeyedArchive::archive_item(value).map_err(|_| NativePollError::WireEncoding)?;
+    plist_to_bin(&archive).map_err(|_| NativePollError::WireEncoding)
+}
+
+fn native_poll_extension(
+    payload: &super::polls::NativePollPayload,
+    session_id: &str,
+) -> Result<ExtensionApp, NativePollError> {
+    check_native_uuid(session_id)?;
+    let is_creation = matches!(payload, super::polls::NativePollPayload::Poll(_));
+    let breadcrumb = "Sent a poll";
+    let balloon = Balloon {
+        url: super::polls::encode_data_url(payload)?,
+        session: Some(session_id.to_string()),
+        layout: if is_creation { Some(BalloonLayout::TemplateLayout {
+            image_subtitle: String::new(), image_title: String::new(),
+            caption: breadcrumb.to_string(), secondary_subcaption: String::new(),
+            tertiary_subcaption: String::new(), subcaption: String::new(),
+            class: NSDictionaryClass::NSDictionary,
+        }) } else { None },
+        ld_text: if is_creation { Some(breadcrumb.to_string()) } else { None },
+        is_live: is_creation,
+        icon: None,
+        required_capabilities: if is_creation { Some(native_poll_capabilities()?) } else { None },
+        send_as_text: if is_creation { Some(true) } else { None },
+    };
+    Ok(ExtensionApp {
+        name: "Polls".to_string(), app_id: None,
+        bundle_id: super::polls::POLLS_BUNDLE_ID.to_string(), balloon: Some(balloon),
+    })
+}
+
+impl ExtensionApp {
+    /// Decode native Polls only; callers must still correlate the conversation,
+    /// authenticated sender, creation GUID, session, and known option UUIDs.
+    pub fn native_poll_payload(&self) -> Result<Option<(String, super::polls::DecodedDataUrl)>, NativePollError> {
+        if self.bundle_id != super::polls::POLLS_BUNDLE_ID { return Ok(None); }
+        let balloon = self.balloon.as_ref().ok_or(NativePollError::InvalidEnvelope)?;
+        let session = balloon.session.as_ref().ok_or(NativePollError::InvalidEnvelope)?;
+        check_native_uuid(session)?;
+        Ok(Some((session.clone(), super::polls::decode_data_url(&balloon.url)?)))
+    }
+}
+
+impl NormalMessage {
+    /// Build one new poll with generated native UUIDs. Persist this message,
+    /// metadata, and its eventual MessageInst GUID before any send/retry.
+    /// `creator_handle` must come from the sender's verified account identity in
+    /// native wire form; this helper does not authenticate or normalize it.
+    pub fn native_poll(
+        creator_handle: String,
+        title: String,
+        options: Vec<String>,
+    ) -> Result<(Self, NativePollMetadata), NativePollError> {
+        if !(2..=12).contains(&options.len()) {
+            return Err(NativePollError::Codec(super::polls::CodecError::InvalidOutboundPoll));
+        }
+        let option_ids: Vec<String> = options.iter().map(|_| Uuid::new_v4().to_string().to_uppercase()).collect();
+        let session_id = Uuid::new_v4().to_string().to_uppercase();
+        let payload = super::polls::PollPayload::new(creator_handle, title,
+            option_ids.iter().cloned().zip(options).collect())?;
+        let message = Self::native_poll_with_ids(payload, &session_id)?;
+        Ok((message, NativePollMetadata { session_id, option_ids }))
+    }
+
+    /// Deterministic constructor for a persisted operation. Validate actual
+    /// native UUIDs here; the portable JSON codec deliberately accepts strings.
+    pub fn native_poll_with_ids(
+        payload: super::polls::PollPayload,
+        session_id: &str,
+    ) -> Result<Self, NativePollError> {
+        super::polls::PollPayload::new(payload.item.creator_handle.clone(), payload.item.title.clone(),
+            payload.item.ordered_poll_options.iter().map(|option|
+                (option.option_identifier.clone(), option.text.clone())).collect())?;
+        for option in &payload.item.ordered_poll_options {
+            check_native_uuid(&option.option_identifier)?;
+            if option.creator_handle != payload.item.creator_handle {
+                return Err(NativePollError::InvalidEnvelope);
+            }
+        }
+        let app = native_poll_extension(&super::polls::NativePollPayload::Poll(payload), session_id)?;
+        let mut message = Self::new(String::new(), MessageType::IMessage);
+        message.parts = MessageParts(vec![IndexedMessagePart {
+            part: MessagePart::Object("Sent a poll".to_string()), idx: None, ext: None,
+        }]);
+        message.app = Some(app);
+        Ok(message)
+    }
+}
+
+impl ReactMessage {
+    /// Build explicit selections for one account, represented as an extension
+    /// reaction to the original poll. It does not expose arbitrary per-vote
+    /// actor overrides or infer an unvote operation from an empty selection.
+    pub fn native_poll_vote(
+        poll_message_id: &str,
+        session_id: &str,
+        participant_handle: String,
+        option_ids: Vec<String>,
+        poll_part: Option<u64>,
+    ) -> Result<Self, NativePollError> {
+        check_native_uuid(poll_message_id)?;
+        for identifier in &option_ids { check_native_uuid(identifier)?; }
+        let payload = super::polls::PollVotePayload::new(option_ids.into_iter()
+            .map(|identifier| (participant_handle.clone(), identifier)).collect())?;
+        let spec = native_poll_extension(&super::polls::NativePollPayload::Vote(payload), session_id)?;
+        Ok(Self {
+            to_uuid: poll_message_id.to_string(), to_part: poll_part,
+            reaction: ReactMessageType::Extension {
+                spec,
+                body: MessageParts(vec![IndexedMessagePart {
+                    part: MessagePart::Object(String::new()), idx: None, ext: None,
+                }]),
+                is_meta: true,
+            },
+            to_text: String::new(), embedded_profile: None,
+        })
+    }
+}
+
+impl MessageInst {
+    /// Extract a poll event before any text/sticker conversion discards the
+    /// extension payload. A returned event is not permission or vote authority.
+    pub fn native_poll_event(&self) -> Result<Option<NativePollEvent>, NativePollError> {
+        let (app, poll_message_id, poll_part, is_vote) = match &self.message {
+            Message::Message(normal) => {
+                let Some(app) = &normal.app else { return Ok(None); };
+                if app.bundle_id != super::polls::POLLS_BUNDLE_ID { return Ok(None); }
+                if normal.service != MessageType::IMessage { return Err(NativePollError::InvalidEnvelope); }
+                (app, self.id.clone(), Some(0), false)
+            }
+            Message::React(ReactMessage { reaction: ReactMessageType::Extension { spec, is_meta, .. }, to_uuid, to_part, .. }) => {
+                if spec.bundle_id != super::polls::POLLS_BUNDLE_ID { return Ok(None); }
+                if !*is_meta { return Err(NativePollError::InvalidEnvelope); }
+                (spec, to_uuid.clone(), *to_part, true)
+            }
+            _ => return Ok(None),
+        };
+        let (session_id, data) = app.native_poll_payload()?.ok_or(NativePollError::InvalidEnvelope)?;
+        match (&data.payload, is_vote) {
+            (super::polls::NativePollPayload::Poll(_), false)
+            | (super::polls::NativePollPayload::Vote(_), true) => {}
+            _ => return Err(NativePollError::InvalidEnvelope),
+        }
+        Ok(Some(NativePollEvent {
+            transport_message_id: self.id.clone(), transport_sender: self.sender.clone(),
+            verification_failed: self.verification_failed, conversation: self.conversation.clone(),
+            session_id, poll_message_id, poll_part, data,
+        }))
     }
 }
 
@@ -2945,5 +3171,149 @@ impl MessageInst {
 impl fmt::Display for MessageInst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "[{}] '{}'", self.sender.clone().unwrap_or("unknown".to_string()), self.message)
+    }
+}
+
+#[cfg(test)]
+mod native_poll_tests {
+    use super::*;
+    use crate::imessage::polls::{self, NativePollPayload, PollPayload};
+
+    const SESSION: &str = "BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB";
+    const POLL_ID: &str = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
+    const OPTION_A: &str = "11111111-1111-4111-8111-111111111111";
+    const OPTION_B: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn payload() -> PollPayload {
+        PollPayload::new("Buddy@Example.test".into(), "Dinner?".into(), vec![
+            (OPTION_A.into(), "Pizza".into()), (OPTION_B.into(), "Sushi".into()),
+        ]).unwrap()
+    }
+
+    fn conversation() -> ConversationData {
+        ConversationData { participants: vec!["mailto:Buddy@Example.test".into(),
+            "mailto:Family@Example.test".into()], cv_name: None,
+            sender_guid: None, after_guid: None }
+    }
+
+    #[test]
+    fn native_poll_constructor_and_actual_balloon_wire_round_trip() {
+        let message = NormalMessage::native_poll_with_ids(payload(), SESSION).unwrap();
+        assert!(matches!(message.service, MessageType::IMessage));
+        assert_eq!(message.parts.raw_text(), "\u{fffd}\u{fffc}");
+        assert!(message.parts.is_multipart());
+        assert!(message.parts.to_xml(None).contains("breadcrumbText=\"Sent a poll\""));
+        let app = message.app.as_ref().unwrap();
+        let (app_info, balloon) = app.to_raw(false).unwrap();
+        let balloon = balloon.unwrap();
+        for decoded in [ExtensionApp::from_ati(&app_info, Some(&balloon)).unwrap(),
+            ExtensionApp::from_bp(&balloon, polls::POLLS_BUNDLE_ID).unwrap()] {
+            let (session, decoded_data) = decoded.native_poll_payload().unwrap().unwrap();
+            assert_eq!(Uuid::parse_str(&session).unwrap(), Uuid::parse_str(SESSION).unwrap());
+            assert_eq!(decoded_data.payload, NativePollPayload::Poll(payload()));
+            let decoded_balloon = decoded.balloon.unwrap();
+            assert_eq!(decoded_balloon.send_as_text, Some(true));
+            assert!(decoded_balloon.is_live);
+            let capabilities = decoded_balloon.required_capabilities.unwrap();
+            let archive: Value = plist::from_bytes(&capabilities).unwrap();
+            let expanded = KeyedArchive::expand_root(&plist_to_bin(&archive).unwrap()).unwrap();
+            let capabilities: NSArray<String> = plist::from_value(&expanded).unwrap();
+            assert_eq!(capabilities.objects, vec!["supports-polls".to_string()]);
+        }
+    }
+
+    #[test]
+    fn generated_native_identifiers_are_valid_and_reusable() {
+        let (message, metadata) = NormalMessage::native_poll("Buddy@Example.test".into(),
+            "Dinner?".into(), vec!["Pizza".into(), "Sushi".into()]).unwrap();
+        assert_eq!(metadata.option_ids.len(), 2);
+        assert_ne!(metadata.option_ids[0], metadata.option_ids[1]);
+        assert!(Uuid::parse_str(&metadata.session_id).is_ok());
+        for identifier in &metadata.option_ids { assert!(Uuid::parse_str(identifier).is_ok()); }
+        let (_, data) = message.app.as_ref().unwrap().native_poll_payload().unwrap().unwrap();
+        let NativePollPayload::Poll(decoded) = data.payload else { panic!("Expected poll") };
+        let rebuilt = NormalMessage::native_poll_with_ids(decoded, &metadata.session_id).unwrap();
+        let (_, rebuilt_data) = rebuilt.app.unwrap().native_poll_payload().unwrap().unwrap();
+        let NativePollPayload::Poll(rebuilt_payload) = rebuilt_data.payload else { panic!("Expected poll") };
+        assert_eq!(rebuilt_payload.item.ordered_poll_options.iter().map(|option|
+            option.option_identifier.clone()).collect::<Vec<_>>(), metadata.option_ids);
+    }
+
+    #[test]
+    fn native_vote_is_a_meta_reaction_and_preserves_original_poll_correlation() {
+        let vote = ReactMessage::native_poll_vote(POLL_ID, SESSION,
+            "Claimed@Example.test".into(), vec![OPTION_A.into(), OPTION_B.into()], Some(0)).unwrap();
+        assert!(matches!(vote.reaction, ReactMessageType::Extension { is_meta: true, .. }));
+        assert_eq!(vote.reaction.get_cmd(), 4000);
+        let mut instance = MessageInst::new(conversation(), "mailto:Actual@Example.test", Message::React(vote));
+        instance.verification_failed = true;
+        let event = instance.native_poll_event().unwrap().unwrap();
+        assert_eq!(event.poll_message_id, POLL_ID);
+        assert_eq!(event.session_id, SESSION);
+        assert_eq!(event.poll_part, Some(0));
+        assert_eq!(event.transport_sender.as_deref(), Some("mailto:Actual@Example.test"));
+        assert!(event.verification_failed);
+        let NativePollPayload::Vote(vote) = event.data.payload else { panic!("Expected vote") };
+        assert_eq!(vote.item.votes.len(), 2);
+        assert_eq!(vote.item.votes[0].participant_handle, "Claimed@Example.test");
+        assert_eq!(vote.item.votes[0].vote_option_identifier, OPTION_A);
+        // The deliberately different claim was preserved, never authenticated
+        // or credited as the transport sender by this extraction helper.
+    }
+
+    #[test]
+    fn native_creation_event_exposes_payload_before_flattening() {
+        let message = NormalMessage::native_poll_with_ids(payload(), SESSION).unwrap();
+        let mut instance = MessageInst::new(conversation(), "mailto:Buddy@Example.test", Message::Message(message));
+        instance.id = POLL_ID.into();
+        let event = instance.native_poll_event().unwrap().unwrap();
+        assert_eq!(event.poll_message_id, POLL_ID);
+        assert_eq!(event.transport_message_id, POLL_ID);
+        assert_eq!(event.data.payload, NativePollPayload::Poll(payload()));
+        assert_eq!(event.conversation.unwrap().participants, conversation().participants);
+    }
+
+    #[test]
+    fn native_constructor_rejects_bad_ids_and_empty_vote_without_panicking() {
+        assert!(NormalMessage::native_poll_with_ids(payload(), "invalid").is_err());
+        let mut bad = payload();
+        bad.item.ordered_poll_options[0].option_identifier = "not-a-native-uuid".into();
+        assert!(NormalMessage::native_poll_with_ids(bad, SESSION).is_err());
+        assert!(ReactMessage::native_poll_vote(POLL_ID, SESSION,
+            "Buddy@Example.test".into(), vec![], Some(0)).is_err());
+        assert!(ReactMessage::native_poll_vote("invalid", SESSION,
+            "Buddy@Example.test".into(), vec![OPTION_A.into()], Some(0)).is_err());
+        let mut app = NormalMessage::native_poll_with_ids(payload(), SESSION).unwrap().app.unwrap();
+        app.balloon.as_mut().unwrap().session = Some("invalid".into());
+        assert!(app.to_raw(false).is_err());
+    }
+
+    #[test]
+    fn malformed_native_session_bytes_are_rejected_without_panicking() {
+        let session: NSUUID = plist::from_value(&Value::Dictionary(Dictionary::from_iter([
+            ("$class".to_string(), Value::String("NSUUID".to_string())),
+            ("NS.uuidbytes".to_string(), Value::Data(vec![1; 15])),
+        ]))).unwrap();
+        let raw = RawBalloonData {
+            ldtext: None, layout: None, app_name: "Polls".into(), app_icon: None,
+            session_identifier: Some(session), live_layout_info: None,
+            required_capabilities: None, send_as_text: None,
+            url: NSURL { base: "$null".into(), relative: "data:,synthetic".into() }, appid: None,
+        };
+        assert!(Balloon::from_raw(raw).is_err());
+    }
+
+    #[test]
+    fn non_poll_extensions_are_ignored_and_payload_kind_mismatch_is_rejected() {
+        let mut message = NormalMessage::native_poll_with_ids(payload(), SESSION).unwrap();
+        message.app.as_mut().unwrap().bundle_id = "example.other.extension".into();
+        let mut instance = MessageInst::new(conversation(), "mailto:Buddy@Example.test", Message::Message(message));
+        assert!(instance.native_poll_event().unwrap().is_none());
+        let Message::Message(message) = &mut instance.message else { panic!("Expected message") };
+        let app = message.app.as_mut().unwrap();
+        app.bundle_id = polls::POLLS_BUNDLE_ID.into();
+        app.balloon.as_mut().unwrap().url = polls::encode_data_url(&NativePollPayload::Vote(
+            polls::PollVotePayload::new(vec![("Buddy@Example.test".into(), OPTION_A.into())]).unwrap())).unwrap();
+        assert!(matches!(instance.native_poll_event(), Err(NativePollError::InvalidEnvelope)));
     }
 }

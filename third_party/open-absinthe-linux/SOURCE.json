@@ -1,0 +1,19 @@
+{
+  "repository": "https://github.com/thescruggs/imessage-linux",
+  "revision": "79a0a753f0513d105f47c0bbd58c8efc7f506a91",
+  "original_crate_path": "crates/open-absinthe",
+  "imported_at": "2026-10-27",
+  "license": "SSPL-1.0",
+  "files_sha256": {
+    "Cargo.toml": "3edeea6373be6ee7975b1131c49916c0142ed4f5b80fd808e5f4e76ca12f65fb",
+    "LICENSE": "f755050fe183fe1dab3e2ca447fb08174ff02df8eb4153d001ca30c0653f9996",
+    "README.md": "45ac45e939a71453cd5ba976d77c87ac2661b8e87c423e72b25bad9251bfe97a",
+    "build.rs": "74e6e5549f7b65a458236159a51c629eb731bb4b1fc37937886d6106f2471b82",
+    "src/emulator.rs": "f915ebcc04d2c44ae81b47c34b728cff068316f9ca5304c931c7a19ac0a8ac91",
+    "src/lib.rs": "fb8b7c55c7785ea0f0ef90ea191068b1658753714ee996a2555e7b0709a306bb",
+    "src/macho.rs": "025e95b7752fc4e5c4f61a0426f118fb4656029ef546747ae36269c647f13d07",
+    "src/nac.rs": "35fd09fed339038e6bd1a07c22aa07f50f9b7879e0fa71caf3d7a89b53e411ed",
+    "tests/missing_binary.rs": "8a7c3d74ac5cbf7a21e7229776f344754af13a650fd650976b21508b51de2311"
+  },
+  "selection": "Upstream library, build script, README, manifest and missing-binary test; account/live tests and public hardware reference fixtures are not redistributed here."
+}

@@ -1,0 +1,21 @@
+# Linux NAC source dependency
+
+Imported unchanged from [thescruggs/imessage-linux](https://github.com/thescruggs/imessage-linux/tree/79a0a753f0513d105f47c0bbd58c8efc7f506a91/crates/open-absinthe), revision `79a0a753f0513d105f47c0bbd58c8efc7f506a91`, on 2026-10-27. Original source hashes are recorded in `SOURCE.json`; retain its SSPL-1.0 [LICENSE](LICENSE) and source notices.
+
+This is the actual Unicorn-based Linux NAC implementation, replacing the nonfunctional optional OpenAbsinthe stub in this fork's Cargo dependency graph. The library reads a separately supplied Apple IMDAppleServices binary; it does not download resources or contact Apple itself. No Apple binary, private hardware identity, credentials, or registered account state is included in this repository.
+
+The upstream library, build script and missing-binary test are retained unchanged. Live/account tests and the public reference-hardware fixture are intentionally excluded from this dependency snapshot. The build investigation exercised the original public reference test separately, with Docker networking disabled, and observed two 338-byte initialization requests with zero hook anomalies. This proves offline initialization, not registration or native message delivery.
+
+Use Rust 1.99.1 and Linux build dependencies: a C/C++ compiler, make, cmake, ninja, pkg-config, libclang, protobuf compiler and perl. The fork's `rust-toolchain.toml` pins the compiler; do not run rustfmt on this repository.
+
+See [BUILDING.md](BUILDING.md) for the exact public submodule initialization, compile-only input preparation, locked worker build and filtered test commands. The build itself needs no Apple binary or account inputs.
+
+Run `python3 third_party/open-absinthe-linux/tools/prepare_resources.py --destination /absolute/path/to/public-resources` to acquire and verify the public NAC binary and certificate. Set `OPEN_ABSINTHE_BINARY` to the resulting `IMDAppleServices` path. The selected directory contains public resources only, not an account or hardware key.
+
+The binary resource is fetched separately from [JJTech0130/nacserver revision `2b12660e66db922c9fc09642a2d05144c7f5e955`](https://github.com/JJTech0130/nacserver/blob/2b12660e66db922c9fc09642a2d05144c7f5e955/IMDAppleServices). Its SHA-256 is `74c2a8fe826a478f14f6e17b3709a8b315e8c0e0e34e3fba6b9c4eee2f4516e9`, and its SHA-1 matches the upstream emulator's required `e1181ccad82e6629d52c6a006645ad87ee59bd13`. The public certificate comes from `https://static.ess.apple.com/identity/validation/cert-1.0.plist` with SHA-256 `6ef3521ed899be820e132a6d8c53cac955267c2c3f862684477524be91dc3a06`. The helper verifies exact size and SHA-256 and refuses to replace an existing mismatched file. Neither resource's rights are conferred by the source crate's SSPL license; they are never included in this source snapshot.
+
+The full public protocol checkout also requires ignored FairPlay certificate include files. `--prepare-legacy-fairplay-fallback` reproduces the retained Corten Makefile's public legacy certificate materialization for compilation. The Rust activation path uses them when creating a new APNs identity. The Buddy worker requires a restored APNs key pair and token, so its intended restored-session text/poll path skips that activation branch (`src/aps.rs`, `do_connect`). This does not verify that those fallback certificates are suitable for current fresh activation or other features. Do not infer account or message compatibility from a successful build.
+
+The inherited root library's `cfg(test)` TLS proxy helper also includes ignored `certs/proxy/push_certificate_chain.pem` and `push_key.pem`. The build investigation supplied a disposable self-signed `buddy-offline-test.invalid` certificate in the ignored workbench to compile that helper; filtered native poll tests do not invoke it. The production worker build excludes this test-only helper and needs neither proxy file.
+
+Existing registered state must be imported privately as a coupled set with its software keystore. Fresh Apple-account login remains separate; the working prebuilt Linux Corten CLI can remain the private login provider. The runtime goal has no Mac relay or framework dependency.

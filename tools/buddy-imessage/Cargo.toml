@@ -1,0 +1,28 @@
+[package]
+name = "buddy-imessage"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "SSPL-1.0"
+
+[workspace]
+
+[dependencies]
+rustpush = { path = "../..", default-features = false, features = ["macos-validation-data", "remote-anisette-v3"] }
+keystore = { path = "../../keystore" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+plist = "1.7.0"
+base64 = "0.21.2"
+uuid = { version = "1.4.1", features = ["v4"] }
+sha2 = "0.10"
+libc = "0.2"
+log = "0.4"
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+# Match Corten's known-compatible AES-wrap behavior during restored account
+# operations; newer OpenSSL wrappers assert on an omitted RFC3394 default IV.
+openssl = { version = ">=0.10.56, <0.10.76", features = ["vendored"] }
+
+[patch.crates-io]
+quinn = { path = "../../third_party/quinn/quinn" }

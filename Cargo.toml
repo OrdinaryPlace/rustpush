@@ -1,3 +1,4 @@
+# Modified 2026-10-27 for OrdinaryPlace Buddy Linux NAC. SSPL v1; see LICENSE.
 [package]
 name = "rustpush"
 version = "0.1.0"
@@ -35,7 +36,7 @@ flume = "0.11.0"
 icloud_auth = { path = "./third_party/apple-private-apis/icloud-auth", default-features = false }
 srp = { path = "./third_party/apple-private-apis/icloud-auth/rustcrypto-srp" }
 omnisette = { path = "./third_party/apple-private-apis/omnisette" }
-open-absinthe = { path = "./open-absinthe", optional = true, features = ["serde"] }
+open-absinthe = { path = "./third_party/open-absinthe-linux", optional = true, features = ["serde"] }
 deku = "0.19.0"
 zip = { version = "2.1.5", default-features = false, features = ["deflate-zlib"] }
 rasn = "0.16.0"

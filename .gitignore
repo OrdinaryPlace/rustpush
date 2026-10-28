@@ -12,3 +12,13 @@
 /anisette_test
 /certs/fairplay/*
 /keystore/target
+__pycache__/
+*.pyc
+/certs/proxy/
+/tools/buddy-imessage/target/
+/runtime-session.json
+/export.json
+/keystore.plist
+/id-cache.plist
+/worker.lock
+/operations/
