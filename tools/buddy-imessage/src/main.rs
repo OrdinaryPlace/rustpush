@@ -339,9 +339,9 @@ impl Worker {
             (NormalMessage::new(text.clone(), MessageType::IMessage), None, None)
         };
         let mut message = MessageInst::new(conversation.protocol(), &bundle.preferred_handle, Message::Message(normal));
-        // Persist the exact group/DM GUID and timestamp the protocol will use,
-        // before crossing the network boundary. Subsequent prepare_send calls
-        // keep this generated conversation GUID and the MessageInst GUID.
+        // Persist stable group/DM and MessageInst GUIDs before crossing the
+        // network boundary. Subsequent prepare_send calls keep these GUIDs,
+        // but refresh the wire timestamp.
         message.prepare_send(&[bundle.preferred_handle]);
         let operation = Operation { version: 1, id: id.clone(), fingerprint: digest,
             message, poll: metadata, poll_payload, status: "prepared".into(), send_diagnostics: None };
@@ -458,6 +458,43 @@ fn message_type(message: &Message) -> &'static str {
     }
 }
 
+struct ErrorReason {
+    category: &'static str,
+    domain: Option<&'static str>,
+    code: Option<i64>,
+    shape: &'static str,
+    bounded_length: usize,
+    message_protection_component_present: bool,
+}
+
+fn error_reason(remote: &str) -> ErrorReason {
+    // fRM is untrusted remote text, not the numeric fR envelope status. Only
+    // this domain is established by the source client's cache-invalidation
+    // handler. Never copy another domain, suffix or free-form reason into JSON.
+    let category = if remote == "ec-com.apple.messageprotection-802" {
+        "message_protection_802"
+    } else { "unknown" };
+    let bounded_length = remote.len().min(129);
+    let message_protection_component_present = remote.len() <= 128
+        && remote.contains("ec-com.apple.messageprotection-");
+    let unknown = |shape: &'static str| ErrorReason { category, domain: None, code: None, shape,
+        bounded_length, message_protection_component_present };
+    if remote.is_empty() { return unknown("empty"); }
+    if remote.len() > 128 { return unknown("oversized"); }
+    if remote.starts_with("type-") { return unknown("blastdoor_type"); }
+    if let Some(suffix) = remote.strip_prefix("ec-com.apple.messageprotection-") {
+        let digits = suffix.strip_prefix('-').unwrap_or(suffix);
+        if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            if let Ok(code) = suffix.parse::<i64>() {
+                return ErrorReason { category, domain: Some("com.apple.messageprotection"),
+                    code: Some(code), shape: "message_protection_numeric", bounded_length,
+                    message_protection_component_present };
+            }
+        }
+    }
+    unknown("unrecognized")
+}
+
 fn inbound_event(handles: &[String], message: MessageInst, connected_at_ms: u64, received_at_ms: u64) -> Value {
     let conversation = message.conversation.as_ref().map(|c| json!({"participants":c.participants,
         "sender_guid":c.sender_guid,"cv_name":c.cv_name,"after_guid":c.after_guid}));
@@ -495,11 +532,15 @@ fn inbound_event(handles: &[String], message: MessageInst, connected_at_ms: u64,
             Message::Read => { event["kind"] = json!("read_receipt"); }
             Message::React(_) => { event["kind"] = json!("reaction"); }
             Message::Error(error) => {
+                let reason = error_reason(&error.status_str);
                 event["kind"] = json!("error");
                 event["status"] = json!(error.status);
-                event["error_category"] = json!(if error.status_str == "ec-com.apple.messageprotection-802" {
-                    "message_protection_802"
-                } else { "unknown" });
+                event["error_category"] = json!(reason.category);
+                event["error_domain"] = json!(reason.domain);
+                event["error_code"] = json!(reason.code);
+                event["error_reason_shape"] = json!(reason.shape);
+                event["error_reason_length"] = json!(reason.bounded_length);
+                event["error_message_protection_component_present"] = json!(reason.message_protection_component_present);
                 event["error_for_message_id"] = json!(uuid::Uuid::parse_str(&error.for_uuid).ok()
                     .map(|guid| guid.to_string().to_uppercase()));
             }
@@ -752,6 +793,9 @@ mod tests {
         assert_eq!(event["message_type"], "error");
         assert_eq!(event["status"], 802);
         assert_eq!(event["error_category"], "unknown");
+        assert_eq!(event["error_domain"], Value::Null);
+        assert_eq!(event["error_code"], Value::Null);
+        assert_eq!(event["error_reason_shape"], "unrecognized");
         assert_eq!(event["message_id"], wrapper);
         assert_eq!(event["error_for_message_id"], target.to_uppercase());
         assert_ne!(event["error_for_message_id"], event["message_id"]);
@@ -787,6 +831,114 @@ mod tests {
             assert_eq!(event["error_category"], category);
             assert!(!serde_json::to_string(&event).unwrap().contains(remote));
             assert!(event.get("status_str").is_none());
+        }
+    }
+
+    #[test]
+    fn message_protection_reason_preserves_only_static_domain_and_signed_numeric_code() {
+        let Command::PreparePoll { conversation, .. } = poll_command() else { panic!("Expected poll command") };
+        for code in [802, 803, 0, -1, i64::MIN, i64::MAX] {
+            let remote = format!("ec-com.apple.messageprotection-{code}");
+            let message = MessageInst::new(conversation.protocol(), "mailto:family@example.test",
+                Message::Error(rustpush::ErrorMessage { for_uuid: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA".into(),
+                    status: 200, status_str: remote.clone() }));
+            let event = inbound_event(&[], message, 0, 31_000);
+            assert_eq!(event["kind"], "error");
+            assert_eq!(event["status"], 200);
+            assert_eq!(event["error_domain"], "com.apple.messageprotection");
+            assert_eq!(event["error_code"], code);
+            assert_eq!(event["error_reason_shape"], "message_protection_numeric");
+            assert_eq!(event["error_reason_length"], remote.len());
+            assert_eq!(event["error_message_protection_component_present"], true);
+            assert_eq!(event["error_category"], if code == 802 { "message_protection_802" } else { "unknown" });
+            assert_eq!(event["error_for_message_id"], "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA");
+            let encoded = serde_json::to_string(&event).unwrap();
+            assert!(!encoded.contains(&remote));
+            assert!(event.get("status_str").is_none());
+        }
+    }
+
+    #[test]
+    fn malformed_untrusted_or_oversized_error_reasons_never_escape() {
+        let Command::PreparePoll { conversation, .. } = poll_command() else { panic!("Expected poll command") };
+        let mut cases = vec![
+            "ec-com.apple.messageprotection-".to_string(),
+            "ec-com.apple.messageprotection--".to_string(),
+            "ec-com.apple.messageprotection-+802".to_string(),
+            "ec-com.apple.messageprotection-802\n".to_string(),
+            "ec-com.apple.messageprotection-802-extra".to_string(),
+            "ec-com.apple.messageprotection-9223372036854775808".to_string(),
+            "ec-com.apple.messageprotection--9223372036854775809".to_string(),
+            "ec-com.apple.messageprotection-８０２".to_string(),
+            "ec-com.apple.unknown-802".to_string(),
+            "REMOTE_PASSWORD_MUST_NEVER_LEAK".to_string(),
+        ];
+        cases.push(format!("ec-com.apple.messageprotection-{}", "0".repeat(128)));
+        for remote in cases {
+            let message = MessageInst::new(conversation.protocol(), "mailto:family@example.test",
+                Message::Error(rustpush::ErrorMessage { for_uuid: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA".into(),
+                    status: 200, status_str: remote.clone() }));
+            let event = inbound_event(&[], message, 0, 31_000);
+            assert_eq!(event["error_domain"], Value::Null);
+            assert_eq!(event["error_code"], Value::Null);
+            assert_eq!(event["error_category"], "unknown");
+            assert_eq!(event["error_reason_shape"], if remote.len() > 128 { "oversized" } else { "unrecognized" });
+            assert!(!serde_json::to_string(&event).unwrap().contains(&remote));
+            assert!(event.get("status_str").is_none());
+        }
+    }
+
+    #[test]
+    fn empty_error_reason_is_distinct_from_unknown_and_cannot_supply_a_code() {
+        let reason = error_reason("");
+        assert_eq!(reason.shape, "empty");
+        assert_eq!(reason.category, "unknown");
+        assert_eq!(reason.domain, None);
+        assert_eq!(reason.code, None);
+        assert_eq!(reason.bounded_length, 0);
+        assert!(!reason.message_protection_component_present);
+        // A noncanonical spelling may yield a numeric reason without changing
+        // the existing exact-match category's compatibility contract.
+        let leading_zero = error_reason("ec-com.apple.messageprotection-0802");
+        assert_eq!(leading_zero.code, Some(802));
+        assert_eq!(leading_zero.category, "unknown");
+    }
+
+    #[test]
+    fn composite_and_blastdoor_shapes_never_infer_domain_or_code_or_emit_source() {
+        let Command::PreparePoll { conversation, .. } = poll_command() else { panic!("Expected poll command") };
+        for (remote, shape, component) in [
+            ("type-SECRET_TEXT_MUST_NEVER_LEAK", "blastdoor_type", false),
+            ("type-SECRET-ec-com.apple.messageprotection-802", "blastdoor_type", true),
+            ("secondary-SECRET-ec-com.apple.messageprotection-802-legacy", "unrecognized", true),
+        ] {
+            let message = MessageInst::new(conversation.protocol(), "mailto:family@example.test",
+                Message::Error(rustpush::ErrorMessage { for_uuid: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA".into(),
+                    status: 200, status_str: remote.into() }));
+            let event = inbound_event(&[], message, 0, 31_000);
+            assert_eq!(event["error_reason_shape"], shape);
+            assert_eq!(event["error_reason_length"], remote.len());
+            assert_eq!(event["error_message_protection_component_present"], component);
+            assert_eq!(event["error_domain"], Value::Null);
+            assert_eq!(event["error_code"], Value::Null);
+            assert_eq!(event["error_category"], "unknown");
+            assert!(!serde_json::to_string(&event).unwrap().contains("SECRET"));
+        }
+    }
+
+    #[test]
+    fn oversized_reasons_expose_only_capped_length_and_are_not_scanned_for_components() {
+        for remote in [
+            format!("ec-com.apple.messageprotection-{}", "0".repeat(200)),
+            format!("{}ec-com.apple.messageprotection-802", "Z".repeat(200)),
+            format!("type-{}", "Z".repeat(2000)),
+        ] {
+            let reason = error_reason(&remote);
+            assert_eq!(reason.bounded_length, 129);
+            assert_eq!(reason.shape, "oversized");
+            assert!(!reason.message_protection_component_present);
+            assert_eq!(reason.domain, None);
+            assert_eq!(reason.code, None);
         }
     }
 

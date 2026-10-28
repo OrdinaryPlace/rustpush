@@ -185,8 +185,28 @@ free-form protocol error text are omitted. `error_category` is the static
 `message_protection_802` only for an exact remote
 `ec-com.apple.messageprotection-802` match (the source client already handles
 that code by invalidating its key cache); all other strings become `unknown`.
-These events remain diagnostic
-evidence; they cannot authorize an action or a resend.
+For reasons of the exact shape `ec-com.apple.messageprotection-<integer>`,
+`error_domain` is the static `com.apple.messageprotection` and `error_code` is
+the signed 64-bit integer. This reason code is distinct from the envelope's
+numeric `status` (`fR`), which is not an HTTP status. Other domains are not
+copied from remote text. Unknown, malformed, overflowing or oversized reasons
+produce null domain/code. `error_reason_shape` is only `empty`, `oversized`,
+`message_protection_numeric`, `blastdoor_type` or `unrecognized`. The
+`blastdoor_type` label recognizes only the bounded `type-` prefix; it does not
+interpret the remaining fields. `error_reason_length` reports the byte length
+up to 128, with 129 meaning longer than the limit. For bounded reasons only,
+`error_message_protection_component_present` indicates whether the known EC
+prefix occurs anywhere. A composite reason does not yield an inferred domain
+or code. Longer reasons are neither parsed nor scanned for that component. No
+raw reason or source substring is emitted.
+
+These shape-only checks follow the reverse-engineered
+[IMBlastdoor reason formatter](https://github.com/EthanArbuckle/iPhone17-1_18.2_22C152_Restore/blob/e26ed4563f78871c59d2d96856756a65d62517e5/System/Library/PrivateFrameworks/IMDaemonCore.framework/IMBlastdoor.m#L403)
+and the newer IDS formatter's
+[secondary/EC/legacy inputs](https://github.com/EthanArbuckle/iPhone18-3_26.1_23B85_Restore/blob/90aa0cfe59d9682b4265e1354c8b19ec3c7823ab/System/Library/PrivateFrameworks/IDS.framework/identityservicesd.app/IDS/IDS_21.mm#L394).
+They do not establish the semantics or grammar of a live composite reason.
+These events remain diagnostic evidence; they cannot authorize an action or a
+resend.
 The JSON payload's creator/participant handle is an untrusted claim: authenticate
 against the transport sender and verified aliases, correlate the original poll
 and session, and validate option IDs before counting a vote. Do not act on
