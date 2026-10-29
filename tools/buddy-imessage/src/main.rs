@@ -23,6 +23,23 @@ use tokio::task::JoinHandle;
 #[derive(Clone, Serialize, Deserialize)]
 struct PollMetadata { session_id: String, option_ids: Vec<String> }
 
+// Upstream MMCS byte fields use plist-specific serde. Keep a JSON-roundtrippable
+// private descriptor and rebuild the attachment; never expose it in reports.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImageUpload {
+    signature: Vec<u8>, object: String, url: String, key: Vec<u8>, size: usize,
+}
+
+impl ImageUpload {
+    fn attachment(&self, image: &media::ImageBinding) -> rustpush::Attachment {
+        rustpush::Attachment { a_type: rustpush::AttachmentType::MMCS(vec![rustpush::MMCSFile {
+            signature: self.signature.clone(), object: self.object.clone(), url: self.url.clone(),
+            key: self.key.clone(), size: self.size }]), part: 0, uti_type: image.uti().into(),
+            mime: image.mime.clone(), name: image.name().into(), iris: false }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Operation {
     version: u32,
@@ -40,6 +57,8 @@ struct Operation {
     feedback: bool,
     #[serde(default)]
     image: Option<media::ImageBinding>,
+    #[serde(default)]
+    image_upload: Option<ImageUpload>,
 }
 
 struct Connected {
@@ -110,7 +129,9 @@ fn finish_feedback(directory: &Path, operation: &mut Operation, diagnostics: Sen
 }
 
 fn start_image(directory: &Path, operation: &mut Operation) -> Result<()> {
-    if operation.image.is_none() || operation.feedback || operation.status != "prepared" {
+    if operation.image.is_none() || operation.image_upload.is_some() || operation.feedback || operation.status != "prepared"
+        || operation.poll.is_some() || operation.poll_payload.is_some() || operation.message.target.is_some()
+        || !matches!(&operation.message.message, Message::Message(normal) if normal.plain_feedback_text() == Some("")) {
         return Err(WorkerError("invalid_image_state"));
     }
     operation.status = "dispatching".into();
@@ -130,6 +151,15 @@ where F: Future<Output = std::result::Result<rustpush::Attachment, E>> {
             return Ok(false);
         }
     };
+    let rustpush::AttachmentType::MMCS(files) = &attachment.a_type else { return Err(WorkerError("invalid_image_upload")); };
+    let [file] = files.as_slice() else { return Err(WorkerError("invalid_image_upload")); };
+    let image = operation.image.as_ref().ok_or(WorkerError("invalid_image_state"))?;
+    if attachment.mime != image.mime || attachment.uti_type != image.uti() || attachment.name != image.name()
+        || attachment.part != 0 || attachment.iris || file.size as u64 != image.size {
+        return Err(WorkerError("invalid_image_upload"));
+    }
+    operation.image_upload = Some(ImageUpload { signature: file.signature.clone(), object: file.object.clone(),
+        url: file.url.clone(), key: file.key.clone(), size: file.size });
     let Message::Message(normal) = &mut operation.message.message else { return Err(WorkerError("invalid_operation_record")); };
     normal.parts = rustpush::MessageParts(vec![rustpush::IndexedMessagePart {
         part: rustpush::MessagePart::Attachment(attachment), idx: None, ext: None }]);
@@ -169,15 +199,30 @@ fn configuration(bundle: &SessionExport) -> Result<Arc<dyn OSConfig>> {
 }
 
 fn save_operation(directory: &Path, operation: &Operation) -> Result<()> {
-    let bytes = serde_json::to_vec(operation).map_err(|_| WorkerError("operation_encode_failed"))?;
+    let mut stored = operation.clone();
+    if stored.image_upload.is_some() {
+        if stored.image.is_none() { return Err(WorkerError("invalid_image_state")); }
+        let Message::Message(normal) = &mut stored.message.message else { return Err(WorkerError("invalid_operation_record")); };
+        normal.parts = NormalMessage::new(String::new(), MessageType::IMessage).parts;
+    }
+    let bytes = serde_json::to_vec(&stored).map_err(|_| WorkerError("operation_encode_failed"))?;
     atomic_private_write(&operation_path(directory, &operation.id)?, &bytes)
 }
 
 fn load_operation(directory: &Path, id: &str) -> Result<Operation> {
     let path = operation_path(directory, id)?;
     let bytes = private_read(&path, MAX_COMMAND_BYTES * 4).map_err(|_| WorkerError("operation_not_found_or_invalid"))?;
-    let record: Operation = serde_json::from_slice(&bytes).map_err(|_| WorkerError("invalid_operation_record"))?;
+    let mut record: Operation = serde_json::from_slice(&bytes).map_err(|_| WorkerError("invalid_operation_record"))?;
     if record.version != 1 || record.id != id { return Err(WorkerError("invalid_operation_record")); }
+    if let Some(upload) = &record.image_upload {
+        let image = record.image.as_ref().ok_or(WorkerError("invalid_image_state"))?;
+        if upload.size as u64 != image.size || record.feedback || record.poll.is_some() || record.poll_payload.is_some() {
+            return Err(WorkerError("invalid_image_state"));
+        }
+        let Message::Message(normal) = &mut record.message.message else { return Err(WorkerError("invalid_operation_record")); };
+        normal.parts = rustpush::MessageParts(vec![rustpush::IndexedMessagePart {
+            part: rustpush::MessagePart::Attachment(upload.attachment(image)), idx: None, ext: None }]);
+    }
     Ok(record)
 }
 
@@ -400,7 +445,8 @@ impl Worker {
             let mut message = MessageInst::new(conversation.protocol(), &bundle.preferred_handle, Message::Message(normal));
             message.prepare_send(&[bundle.preferred_handle]);
             let operation = Operation { version: 1, id: id.clone(), fingerprint: digest, message,
-                poll: None, poll_payload: None, status: "prepared".into(), send_diagnostics: None, feedback: false, image: Some(image) };
+                poll: None, poll_payload: None, status: "prepared".into(), send_diagnostics: None, feedback: false,
+                image: Some(image), image_upload: None };
             save_operation(&self.work_dir, &operation)?;
             self.operations.lock().map_err(|_| WorkerError("operation_state_failed"))?.insert(id.clone(), operation.clone());
             return Ok(operation);
@@ -444,7 +490,8 @@ impl Worker {
         // but refresh the wire timestamp.
         message.prepare_send(&[bundle.preferred_handle]);
         let operation = Operation { version: 1, id: id.clone(), fingerprint: digest,
-            message, poll: metadata, poll_payload, status: "prepared".into(), send_diagnostics: None, feedback, image: None };
+            message, poll: metadata, poll_payload, status: "prepared".into(), send_diagnostics: None, feedback,
+            image: None, image_upload: None };
         save_operation(&self.work_dir, &operation)?;
         self.operations.lock().map_err(|_| WorkerError("operation_state_failed"))?.insert(id.clone(), operation.clone());
         Ok(operation)
@@ -955,8 +1002,30 @@ mod tests {
         let stored = load_operation(&directory.0, "synthetic-image").unwrap();
         assert!(matches!(&stored.message.message, Message::Message(normal) if normal.parts.has_attachments()));
         assert_eq!(stored.status, "dispatching");
+        assert_eq!(stored.image_upload.as_ref().unwrap().key, vec![42;32]);
+        save_operation(&directory.0, &stored).unwrap();
+        let restored = load_operation(&directory.0, "synthetic-image").unwrap();
+        assert_eq!(restored.message.id, guid);
+        assert!(matches!(&restored.message.message, Message::Message(normal) if normal.parts.has_attachments()));
+        assert!(restored.image_upload.is_some());
         assert!(!report_operation(&stored, "request").to_string().contains("PRIVATE"));
+        assert!(report_operation(&stored, "request").get("image_upload").is_none());
         assert!(start_image(&directory.0, &mut operation).is_err());
+    }
+
+    #[test]
+    fn image_dispatch_rejects_mixed_or_replaced_plaintext_before_attempt() {
+        let directory = PrivateTestDirectory::new();
+        let mut worker = offline_worker(&directory.0);
+        let operation = worker.prepare(&image_command(&directory.0)).unwrap();
+        let before = fs::read(operation_path(&directory.0, "synthetic-image").unwrap()).unwrap();
+        let mut mixed = operation.clone();
+        mixed.poll = Some(PollMetadata { session_id: "synthetic".into(), option_ids: vec![] });
+        assert!(start_image(&directory.0, &mut mixed).is_err());
+        let mut replaced = operation;
+        replaced.message.message = Message::Message(NormalMessage::new("replaced".into(), MessageType::IMessage));
+        assert!(start_image(&directory.0, &mut replaced).is_err());
+        assert_eq!(fs::read(operation_path(&directory.0, "synthetic-image").unwrap()).unwrap(), before);
     }
 
     #[tokio::test]
@@ -1457,8 +1526,12 @@ mod tests {
         let first = worker.prepare(&poll_command()).unwrap();
         let mut value = serde_json::to_value(&first).unwrap();
         value.as_object_mut().unwrap().remove("send_diagnostics");
+        value.as_object_mut().unwrap().remove("feedback");
+        value.as_object_mut().unwrap().remove("image");
+        value.as_object_mut().unwrap().remove("image_upload");
         let decoded: Operation = serde_json::from_value(value).unwrap();
         assert!(decoded.send_diagnostics.is_none());
+        assert!(!decoded.feedback && decoded.image.is_none() && decoded.image_upload.is_none());
         assert_eq!(decoded.message.id, first.message.id);
         assert_eq!(decoded.fingerprint, first.fingerprint);
         let response = report_operation(&decoded, "status-query");
