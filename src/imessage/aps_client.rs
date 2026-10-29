@@ -325,6 +325,15 @@ impl IMClient {
         Ok(())
     }
 
+    /// Plain normal iMessage feedback retains its ordinary response/receipt
+    /// wire flags, but may be cancelled by the worker's short send budget.
+    pub async fn send_feedback(&self, message: &mut MessageInst) -> Result<SendJob, PushError> {
+        if !matches!(&message.message, Message::Message(normal) if normal.plain_feedback_text().is_some()) {
+            return Err(PushError::BadMsg);
+        }
+        self.send_internal(message, true).await
+    }
+
     async fn send_internal(&self, message: &mut MessageInst, transient: bool) -> Result<SendJob, PushError> {
         let handles = self.identity.get_handles().await;
 
@@ -372,7 +381,11 @@ impl IMClient {
         let ids_message = message.get_ids(&my_handles, &self.conn, true).await?;
 
         if transient {
-            self.identity.send_transient_message(topic, ids_message, message_targets).await
+            if matches!(&message.message, Message::Typing(_, None)) {
+                self.identity.send_transient_message(topic, ids_message, message_targets).await
+            } else {
+                self.identity.send_bounded_message(topic, ids_message, message_targets).await
+            }
         } else {
             self.identity.send_message(topic, ids_message, message_targets).await
         }

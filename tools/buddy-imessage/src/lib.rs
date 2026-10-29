@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 
 pub const MAX_EXPORT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_COMMAND_BYTES: usize = 128 * 1024;
+pub const MAX_FEEDBACK_BYTES: usize = 1000;
 pub const MAX_DIAGNOSTIC_ERROR_CODES: usize = 64;
 
 /// Static categories only. Never format a source parser/crypto/network error.
@@ -260,6 +261,7 @@ pub enum Command {
     Typing { id: String, conversation: Conversation, active: bool },
     Status { id: String, operation_id: String },
     SendText { id: String, conversation: Conversation, text: String },
+    SendFeedback { id: String, conversation: Conversation, text: String },
     SendPoll { id: String, conversation: Conversation, question: String, options: Vec<String> },
     PrepareText { id: String, conversation: Conversation, text: String },
     PreparePoll { id: String, conversation: Conversation, question: String, options: Vec<String> },
@@ -272,6 +274,7 @@ impl Command {
             Self::Validate { id } | Self::Connect { id } | Self::Disconnect { id }
             | Self::Typing { id, .. }
             | Self::Status { id, .. } | Self::SendText { id, .. } | Self::SendPoll { id, .. }
+            | Self::SendFeedback { id, .. }
             | Self::PrepareText { id, .. } | Self::PreparePoll { id, .. } | Self::Dispatch { id, .. } => id,
         }
     }
@@ -581,6 +584,18 @@ mod tests {
         }
         value.as_object_mut().unwrap().remove("active");
         assert!(parse_command(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+
+    #[test]
+    fn feedback_commands_reject_recipient_actor_and_timeout_overrides() {
+        let raw = br#"{"op":"send_feedback","id":"feedback-1","conversation":{"participants":["mailto:buddy@example.test","tel:+15555550123"]},"text":"Working on it."}"#;
+        assert!(matches!(parse_command(raw), Ok(Command::SendFeedback { .. })));
+        let value: Value = serde_json::from_slice(raw).unwrap();
+        for field in ["sender", "recipient", "timeout", "message_guid", "active"] {
+            let mut changed = value.clone();
+            changed[field] = Value::String("synthetic".into());
+            assert!(parse_command(&serde_json::to_vec(&changed).unwrap()).is_err());
+        }
     }
 
     #[test]

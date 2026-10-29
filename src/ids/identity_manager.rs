@@ -958,9 +958,15 @@ impl IdentityResource {
     /// Counters/cache writes already performed are retained on cancellation.
     pub async fn send_transient_message(&self, topic: &'static str, ids_message: IDSSendMessage,
         message_targets: Vec<DeliveryHandle>) -> Result<SendJob, PushError> {
-        if !ids_message.no_response || ids_message.queue_id.is_some() || ids_message.scheduled_ms.is_some() {
-            return Err(PushError::BadMsg);
-        }
+        if !ids_message.no_response { return Err(PushError::BadMsg); }
+        self.send_bounded_message(topic, ids_message, message_targets).await
+    }
+
+    /// Await the complete unqueued send directly, including IDS responses when
+    /// requested. A caller timeout cancels this future without a detached job.
+    pub async fn send_bounded_message(&self, topic: &'static str, ids_message: IDSSendMessage,
+        message_targets: Vec<DeliveryHandle>) -> Result<SendJob, PushError> {
+        if ids_message.queue_id.is_some() || ids_message.scheduled_ms.is_some() { return Err(PushError::BadMsg); }
         self.send_message_internal(topic, ids_message, message_targets, true).await
     }
 

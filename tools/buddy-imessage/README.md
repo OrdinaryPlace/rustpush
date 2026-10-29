@@ -88,6 +88,7 @@ startup failures have a null `request_id`; detailed input is never echoed.
 {"op":"validate","id":"check-1"}
 {"op":"connect","id":"connect-1"}
 {"op":"typing","id":"typing-1","conversation":{"participants":["mailto:buddy@example.test","mailto:family@example.test"]},"active":true}
+{"op":"send_feedback","id":"stable-feedback-1","conversation":{"participants":["mailto:buddy@example.test","mailto:family@example.test"]},"text":"I'm working on it."}
 {"op":"send_text","id":"stable-action-1","conversation":{"participants":["mailto:buddy@example.test","mailto:family@example.test"]},"text":"Hello"}
 {"op":"send_poll","id":"stable-poll-1","conversation":{"participants":["mailto:buddy@example.test","mailto:family@example.test"]},"question":"Dinner?","options":["Pizza","Sushi"]}
 {"op":"status","id":"query-1","operation_id":"stable-poll-1"}
@@ -121,6 +122,19 @@ typing start has no encrypted payload, while stop has an encrypted payload and
 advances the existing per-device NGM counters normally. Recipient lookup can also
 update the existing key cache. Cancellation never rolls back those counters or
 creates a replacement identity.
+
+`capabilities.feedback:true` advertises a separate bounded, durable plain-text
+feedback operation. It accepts at most 1000 UTF-8 bytes and the same verified
+direct audience. It persists the ordinary iMessage GUID and intent before I/O,
+keeps normal encrypted text/response flags, and uses a two-second enclosing
+budget for send plus the existing external-result observation. A timeout cancels
+the directly awaited job and stores `uncertain` with the same GUID; it does not
+leave a detached job blocking later commands. Already submitted bytes cannot be
+recalled. Positive normal external transport evidence is required for
+`submitted`; neither status proves recipient delivery. Repeated IDs return their
+stored state; changed content conflicts and uncertain sends are never retried.
+`send_text` retains its original send/observation behavior. A host must not use it
+as a fallback for optional feedback on an older worker without the capability.
 
 `prepare_text` and `prepare_poll` accept the same data as their `send_` variants
 but only create a private durable intent offline. Use
