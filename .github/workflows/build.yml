@@ -215,10 +215,14 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.export_release }}
         env:
           GH_TOKEN: ${{ github.token }}
+          BUDDY_RELEASE_ACTOR: ${{ github.actor }}
+          BUDDY_RELEASE_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = OrdinaryPlace/rustpush
           test "$GITHUB_REF" = refs/heads/buddy/send-diagnostics
+          test "$BUDDY_RELEASE_ACTOR" = jtorrap
+          test "$BUDDY_RELEASE_TRIGGERING_ACTOR" = jtorrap
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           [[ "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]]
           [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
@@ -231,16 +235,18 @@ jobs:
             .account_state_or_runtime_apple_binary_supplied==false and .test_networks=={}
           ' build-metadata.json >/dev/null
           asset="buddy-linux-amd64-${GITHUB_SHA}-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar.gz"
-          tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+          tar --format=ustar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
             -czf "$RUNNER_TEMP/$asset" .
           cd "$RUNNER_TEMP"
           sha256sum "$asset" > "$asset.sha256"
           manifest_sha=$(sha256sum buddy-artifact/SHA256SUMS | cut -d ' ' -f1)
           bundle_sha=$(sha256sum "$asset" | cut -d ' ' -f1)
+          worker_sha=$(sha256sum buddy-artifact/buddy-imessage | cut -d ' ' -f1)
+          worker_size=$(stat -c %s buddy-artifact/buddy-imessage)
           tag="buddy-worker-${GITHUB_SHA}-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          printf 'Public Linux/amd64 worker, licenses and build provenance only.\n\nSource: `%s`\nRun: %s/%s/actions/runs/%s\nArtifact manifest SHA256: `%s`\nBundle SHA256: `%s`\nNo private state, runtime Apple resource or account credentials.\n' \
+          printf 'Public Linux/amd64 worker, licenses and build provenance only.\n\nSource: `%s`\nRun: %s/%s/actions/runs/%s\nArtifact manifest SHA256: `%s`\nBundle SHA256: `%s`\nWorker SHA256: `%s`\nWorker bytes: `%s`\nNo private state, runtime Apple resource or account credentials.\n' \
             "$GITHUB_SHA" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" \
-            "$manifest_sha" "$bundle_sha" > worker-release-notes.md
+            "$manifest_sha" "$bundle_sha" "$worker_sha" "$worker_size" > worker-release-notes.md
           gh release create "$tag" "$asset" "$asset.sha256" \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --latest=false \
             --title "Buddy worker ${GITHUB_SHA:0:12} (run $GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT)" \
@@ -255,7 +261,7 @@ jobs:
 
   release-export:
     name: Owner-requested public worker export
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.export_release && github.repository == 'OrdinaryPlace/rustpush' && github.ref == 'refs/heads/buddy/send-diagnostics' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.export_release && github.repository == 'OrdinaryPlace/rustpush' && github.ref == 'refs/heads/buddy/send-diagnostics' && github.actor == 'jtorrap' && github.triggering_actor == 'jtorrap' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
