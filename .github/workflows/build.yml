@@ -5,7 +5,7 @@ name: Buddy Linux build
   push:
     branches: ["buddy/**"]
   pull_request:
-    branches: ["buddy/native-polls"]
+    branches: ["buddy/native-polls", "buddy/send-diagnostics"]
   workflow_dispatch:
 
 permissions:

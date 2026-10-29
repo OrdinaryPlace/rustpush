@@ -792,6 +792,18 @@ pub struct LinkMeta {
 }
 
 impl NormalMessage {
+    /// Return only the unformatted, single-part text shape used by feedback.
+    pub fn plain_feedback_text(&self) -> Option<&str> {
+        if self.service != MessageType::IMessage || self.effect.is_some() || self.reply_guid.is_some()
+            || self.reply_part.is_some() || self.subject.is_some() || self.app.is_some() || self.link_meta.is_some()
+            || self.voice || self.scheduled.is_some() || self.embedded_profile.is_some() { return None; }
+        match self.parts.0.as_slice() {
+            [IndexedMessagePart { part: MessagePart::Text(text, TextFormat::Flags(TextFlags {
+                bold: false, italic: false, underline: false, strikethrough: false })), idx: None, ext: None }] => Some(text),
+            _ => None,
+        }
+    }
+
     pub fn new(text: String, service: MessageType) -> NormalMessage {
         NormalMessage {
             parts: MessageParts(vec![IndexedMessagePart {

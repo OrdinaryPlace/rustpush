@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 
 pub const MAX_EXPORT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_COMMAND_BYTES: usize = 128 * 1024;
+pub const MAX_FEEDBACK_BYTES: usize = 1000;
 pub const MAX_DIAGNOSTIC_ERROR_CODES: usize = 64;
 
 /// Static categories only. Never format a source parser/crypto/network error.
@@ -257,8 +258,10 @@ pub enum Command {
     Validate { id: String },
     Connect { id: String },
     Disconnect { id: String },
+    Typing { id: String, conversation: Conversation, active: bool },
     Status { id: String, operation_id: String },
     SendText { id: String, conversation: Conversation, text: String },
+    SendFeedback { id: String, conversation: Conversation, text: String },
     SendPoll { id: String, conversation: Conversation, question: String, options: Vec<String> },
     PrepareText { id: String, conversation: Conversation, text: String },
     PreparePoll { id: String, conversation: Conversation, question: String, options: Vec<String> },
@@ -269,10 +272,32 @@ impl Command {
     pub fn id(&self) -> &str {
         match self {
             Self::Validate { id } | Self::Connect { id } | Self::Disconnect { id }
+            | Self::Typing { id, .. }
             | Self::Status { id, .. } | Self::SendText { id, .. } | Self::SendPoll { id, .. }
+            | Self::SendFeedback { id, .. }
             | Self::PrepareText { id, .. } | Self::PreparePoll { id, .. } | Self::Dispatch { id, .. } => id,
         }
     }
+}
+
+/// Transient typing is restricted to a direct conversation with one external
+/// peer. The caller supplies the connected, verified actor; JSON cannot do so.
+pub fn validate_typing_conversation(conversation: &Conversation, actor: &str, own_handles: &[String]) -> Result<()> {
+    conversation.validate(actor)?;
+    if !own_handles.iter().any(|own| own == actor) { return Err(WorkerError("own_identity_changed")); }
+    if conversation.participants.len() != 2 || conversation.participants.iter()
+        .filter(|participant| !own_handles.contains(participant)).count() != 1 {
+        return Err(WorkerError("invalid_typing_conversation"));
+    }
+    Ok(())
+}
+
+pub fn typing_message(conversation: &Conversation, active: bool, actor: &str,
+    own_handles: &[String]) -> Result<rustpush::MessageInst> {
+    validate_typing_conversation(conversation, actor, own_handles)?;
+    let mut message = rustpush::MessageInst::new(conversation.protocol(), actor, rustpush::Message::Typing(active, None));
+    message.prepare_send(own_handles);
+    Ok(message)
 }
 
 pub fn parse_command(line: &[u8]) -> Result<Command> {
@@ -541,6 +566,62 @@ mod tests {
         assert!(parse_command(br#"{"op":"connect","id":"../escape"}"#).is_err());
         assert!(parse_command(br#"{"op":"connect","id":"ok"}"#).is_ok());
         assert!(parse_command(&vec![b'x'; MAX_COMMAND_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn typing_commands_require_explicit_boolean_and_reject_actor_or_text_overrides() {
+        let raw = br#"{"op":"typing","id":"typing-1","conversation":{"participants":["mailto:buddy@example.test","tel:+15555550123"]},"active":true}"#;
+        assert!(matches!(parse_command(raw), Ok(Command::Typing { active: true, .. })));
+        let mut value: Value = serde_json::from_slice(raw).unwrap();
+        for field in ["sender", "text", "app", "message_guid"] {
+            let mut changed = value.clone();
+            changed[field] = Value::String("synthetic".into());
+            assert!(parse_command(&serde_json::to_vec(&changed).unwrap()).is_err());
+        }
+        for active in [Value::Null, Value::String("true".into()), Value::Number(1.into())] {
+            value["active"] = active;
+            assert!(parse_command(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+        value.as_object_mut().unwrap().remove("active");
+        assert!(parse_command(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+
+    #[test]
+    fn feedback_commands_reject_recipient_actor_and_timeout_overrides() {
+        let raw = br#"{"op":"send_feedback","id":"feedback-1","conversation":{"participants":["mailto:buddy@example.test","tel:+15555550123"]},"text":"Working on it."}"#;
+        assert!(matches!(parse_command(raw), Ok(Command::SendFeedback { .. })));
+        let value: Value = serde_json::from_slice(raw).unwrap();
+        for field in ["sender", "recipient", "timeout", "message_guid", "active"] {
+            let mut changed = value.clone();
+            changed[field] = Value::String("synthetic".into());
+            assert!(parse_command(&serde_json::to_vec(&changed).unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn typing_builder_binds_direct_peer_and_preserves_start_stop_wire_flags() {
+        let actor = "mailto:buddy@example.test".to_string();
+        let peer = "tel:+15555550123".to_string();
+        let own = vec![actor.clone(), "mailto:alias@example.test".into()];
+        let mut conversation = Conversation { participants: vec![actor.clone(), peer.clone()],
+            sender_guid: Some("AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA".into()), cv_name: None, after_guid: None };
+        for active in [true, false] {
+            let message = typing_message(&conversation, active, &actor, &own).unwrap();
+            assert_eq!(message.sender.as_deref(), Some(actor.as_str()));
+            assert!(matches!(message.message, rustpush::Message::Typing(value, None) if value == active));
+            assert_eq!(message.message.get_c(), 100);
+            assert_eq!(message.message.get_nr(), Some(true));
+            assert_eq!(message.get_ex(), Some(0));
+            assert_eq!(message.has_payload(), !active);
+            assert_eq!(message.get_send_participants(&own), vec![peer.clone()]);
+            assert_eq!(message.conversation.unwrap().sender_guid, conversation.sender_guid);
+        }
+        assert!(typing_message(&conversation, true, "mailto:stranger@example.test", &own).is_err());
+        assert!(typing_message(&conversation, true, &actor, &[]).is_err());
+        conversation.participants[1] = own[1].clone();
+        assert!(matches!(typing_message(&conversation, true, &actor, &own), Err(WorkerError("invalid_typing_conversation"))));
+        conversation.participants = vec![actor.clone(), peer, "mailto:third@example.test".into()];
+        assert!(matches!(typing_message(&conversation, true, &actor, &own), Err(WorkerError("invalid_typing_conversation"))));
     }
 
     #[test]

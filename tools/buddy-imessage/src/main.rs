@@ -7,6 +7,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, atomic::{AtomicBool, Ordering}};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::future::Future;
 
 use buddy_imessage::*;
 use keystore::{init_keystore, software::{NoEncryptor, SoftwareKeystore, SoftwareKeystoreState}};
@@ -35,6 +36,8 @@ struct Operation {
     status: String,
     #[serde(default)]
     send_diagnostics: Option<SendDiagnostics>,
+    #[serde(default)]
+    feedback: bool,
 }
 
 struct Connected {
@@ -60,6 +63,47 @@ struct Worker {
     initialized: bool,
     persistence_failed: Arc<AtomicBool>,
     operations: Arc<Mutex<HashMap<String, Operation>>>,
+}
+
+const TYPING_SEND_BUDGET: Duration = Duration::from_secs(2);
+const FEEDBACK_SEND_BUDGET: Duration = Duration::from_secs(2);
+
+fn ready_event() -> Value {
+    json!({"event":"ready","connected":false,"network_contacted":false,"capabilities":{"typing":true,"feedback":true}})
+}
+
+async fn typing_status<F, E>(send: F, budget: Duration) -> &'static str
+where F: Future<Output = std::result::Result<(), E>> {
+    match tokio::time::timeout(budget, send).await {
+        Ok(Ok(())) => "submitted",
+        _ => "uncertain",
+    }
+}
+
+async fn feedback_diagnostics<F, E>(send: F, budget: Duration) -> SendDiagnostics
+where F: Future<Output = std::result::Result<SendDiagnostics, E>> {
+    if budget.is_zero() {
+        return SendDiagnostics { job_state: SendJobState::ClientTimedOut, ..SendDiagnostics::default() };
+    }
+    match tokio::time::timeout(budget, send).await {
+        Ok(Ok(diagnostics)) => diagnostics,
+        Ok(Err(_)) => SendDiagnostics { job_state: SendJobState::ClientFailed, ..SendDiagnostics::default() },
+        Err(_) => SendDiagnostics { job_state: SendJobState::ClientTimedOut, ..SendDiagnostics::default() },
+    }
+}
+
+fn start_feedback(directory: &Path, operation: &mut Operation) -> Result<()> {
+    if !operation.feedback || operation.status != "prepared" { return Err(WorkerError("invalid_feedback_state")); }
+    operation.status = "dispatching".into();
+    operation.send_diagnostics = Some(SendDiagnostics::default());
+    save_operation(directory, operation)
+}
+
+fn finish_feedback(directory: &Path, operation: &mut Operation, diagnostics: SendDiagnostics) -> Result<()> {
+    if !operation.feedback || operation.status != "dispatching" { return Err(WorkerError("invalid_feedback_state")); }
+    operation.status = if diagnostics.submitted() { "submitted" } else { "uncertain" }.into();
+    operation.send_diagnostics = Some(diagnostics);
+    save_operation(directory, operation)
 }
 
 fn plist_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
@@ -310,14 +354,17 @@ impl Worker {
 
     fn prepare(&mut self, command: &Command) -> Result<Operation> {
         let bundle = load_bundle(&self.export_path, &self.work_dir)?;
+        let feedback = matches!(command, Command::SendFeedback { .. });
         let (id, conversation, text, poll) = match command {
-            Command::SendText { id, conversation, text } | Command::PrepareText { id, conversation, text } =>
+            Command::SendText { id, conversation, text } | Command::PrepareText { id, conversation, text }
+            | Command::SendFeedback { id, conversation, text } =>
                 (id, conversation, Some(text), None),
             Command::SendPoll { id, conversation, question, options } | Command::PreparePoll { id, conversation, question, options } =>
                 (id, conversation, None, Some((question, options))),
             _ => return Err(WorkerError("invalid_operation")),
         };
         conversation.validate(&bundle.preferred_handle)?;
+        if feedback { validate_typing_conversation(conversation, &bundle.preferred_handle, &[bundle.preferred_handle.clone()])?; }
         let digest = fingerprint(command)?;
         if operation_path(&self.work_dir, id)?.exists() {
             let existing = load_operation(&self.work_dir, id)?;
@@ -336,6 +383,7 @@ impl Worker {
         } else {
             let text = text.ok_or(WorkerError("invalid_operation"))?;
             if text.is_empty() || text.len() > 32 * 1024 { return Err(WorkerError("invalid_text")); }
+            if feedback && (text.trim().is_empty() || text.len() > MAX_FEEDBACK_BYTES) { return Err(WorkerError("invalid_feedback_text")); }
             (NormalMessage::new(text.clone(), MessageType::IMessage), None, None)
         };
         let mut message = MessageInst::new(conversation.protocol(), &bundle.preferred_handle, Message::Message(normal));
@@ -344,20 +392,22 @@ impl Worker {
         // but refresh the wire timestamp.
         message.prepare_send(&[bundle.preferred_handle]);
         let operation = Operation { version: 1, id: id.clone(), fingerprint: digest,
-            message, poll: metadata, poll_payload, status: "prepared".into(), send_diagnostics: None };
+            message, poll: metadata, poll_payload, status: "prepared".into(), send_diagnostics: None, feedback };
         save_operation(&self.work_dir, &operation)?;
         self.operations.lock().map_err(|_| WorkerError("operation_state_failed"))?.insert(id.clone(), operation.clone());
         Ok(operation)
     }
 
     async fn dispatch(&mut self, operation_id: &str) -> Result<Operation> {
+        let feedback_deadline = tokio::time::Instant::now() + FEEDBACK_SEND_BUDGET;
         let connected = self.connected.as_ref().ok_or(WorkerError("not_connected"))?;
         if self.persistence_failed.load(Ordering::SeqCst) { return Err(WorkerError("state_persist_failed")); }
+        let mut operation = load_operation(&self.work_dir, operation_id)?;
+        if operation.feedback { return self.dispatch_feedback(operation, feedback_deadline).await; }
         let own_handles = connected.client.identity.get_handles().await;
         if !own_handles.contains(&connected.actor) {
             return Err(WorkerError("own_identity_changed"));
         }
-        let mut operation = load_operation(&self.work_dir, operation_id)?;
         if operation.status != "prepared" { return Ok(operation); }
         if operation.message.sender.as_deref() != Some(connected.actor.as_str()) || operation.message.target.is_some() {
             return Err(WorkerError("operation_actor_mismatch"));
@@ -389,6 +439,45 @@ impl Worker {
         Ok(operation)
     }
 
+    async fn dispatch_feedback(&mut self, mut operation: Operation, deadline: tokio::time::Instant) -> Result<Operation> {
+        let connected = self.connected.as_ref().ok_or(WorkerError("not_connected"))?;
+        if self.persistence_failed.load(Ordering::SeqCst) { return Err(WorkerError("state_persist_failed")); }
+        if operation.status != "prepared" { return Ok(operation); }
+        if !operation.feedback || operation.message.sender.as_deref() != Some(connected.actor.as_str())
+            || operation.message.target.is_some() || operation.poll.is_some() || operation.poll_payload.is_some() {
+            return Err(WorkerError("operation_actor_mismatch"));
+        }
+        match &operation.message.message {
+            Message::Message(normal) if normal.plain_feedback_text().is_some_and(|text|
+                !text.trim().is_empty() && text.len() <= MAX_FEEDBACK_BYTES) => {},
+            _ => return Err(WorkerError("invalid_feedback_text")),
+        }
+        let conversation = operation.message.conversation.as_ref().ok_or(WorkerError("invalid_operation_record"))?;
+        let conversation = Conversation { participants: conversation.participants.clone(), sender_guid: conversation.sender_guid.clone(),
+            cv_name: conversation.cv_name.clone(), after_guid: conversation.after_guid.clone() };
+        validate_typing_conversation(&conversation, &connected.actor, &[connected.actor.clone()])?;
+        start_feedback(&self.work_dir, &mut operation)?;
+        let remaining = deadline.checked_duration_since(tokio::time::Instant::now()).unwrap_or(Duration::ZERO);
+        let send = async {
+            let own_handles = connected.client.identity.get_handles().await;
+            validate_typing_conversation(&conversation, &connected.actor, &own_handles)?;
+            let mut job = connected.client.send_feedback(&mut operation.message).await.map_err(|_| WorkerError("feedback_send_failed"))?;
+            if let Some(handle) = job.handle.take() {
+                handle.abort();
+                return Err(WorkerError("unexpected_feedback_send_job"));
+            }
+            // The direct-awaited path has already completed; its closed result
+            // stream is still checked with the ordinary external acceptance rule.
+            Ok::<_, WorkerError>(observe_send_job(job, &own_handles, &conversation.participants, FEEDBACK_SEND_BUDGET).await)
+        };
+        let mut diagnostics = feedback_diagnostics(send, remaining).await;
+        if self.persistence_failed.load(Ordering::SeqCst) { diagnostics.job_state = SendJobState::ClientFailed; }
+        finish_feedback(&self.work_dir, &mut operation, diagnostics)?;
+        self.operations.lock().map_err(|_| WorkerError("operation_state_failed"))?
+            .insert(operation.id.clone(), operation.clone());
+        Ok(operation)
+    }
+
     async fn command(&mut self, command: Command) -> Result<bool> {
         let id = command.id().to_string();
         match &command {
@@ -402,9 +491,29 @@ impl Worker {
                 emit(&self.output, json!({"event":"disconnected","id":id,"request_id":id})).await;
                 return Ok(false);
             }
+            Command::Typing { conversation, active, .. } => {
+                let connected = self.connected.as_ref().ok_or(WorkerError("not_connected"))?;
+                if self.persistence_failed.load(Ordering::SeqCst) { return Err(WorkerError("state_persist_failed")); }
+                validate_typing_conversation(conversation, &connected.actor, &[connected.actor.clone()])?;
+                let send = async {
+                    let own_handles = connected.client.identity.get_handles().await;
+                    let mut message = typing_message(conversation, *active, &connected.actor, &own_handles)?;
+                    connected.client.send_typing(&mut message).await.map_err(|_| WorkerError("typing_send_failed"))
+                };
+                let status = typing_status(send, TYPING_SEND_BUDGET).await;
+                let status = if self.persistence_failed.load(Ordering::SeqCst) { "uncertain" } else { status };
+                emit(&self.output, json!({"event":"typing","id":id,"request_id":id,"active":active,"status":status})).await;
+            }
             Command::Status { operation_id, .. } => emit(&self.output, report_operation(&load_operation(&self.work_dir, operation_id)?, &id)).await,
             Command::PrepareText { .. } | Command::PreparePoll { .. } => {
                 let operation = self.prepare(&command)?;
+                emit(&self.output, report_operation(&operation, &id)).await;
+            }
+            Command::SendFeedback { .. } => {
+                let deadline = tokio::time::Instant::now() + FEEDBACK_SEND_BUDGET;
+                if self.connected.is_none() { return Err(WorkerError("not_connected")); }
+                let operation = self.prepare(&command)?;
+                let operation = self.dispatch_feedback(operation, deadline).await?;
                 emit(&self.output, report_operation(&operation, &id)).await;
             }
             Command::SendText { .. } | Command::SendPoll { .. } => {
@@ -622,7 +731,7 @@ async fn run(output: mpsc::Sender<Value>) -> Result<()> {
     let lock = OpenOptions::new().read(true).write(true).create(true).mode(0o600).custom_flags(libc::O_NOFOLLOW)
         .open(work_dir.join("worker.lock")).map_err(|_| WorkerError("worker_lock_failed"))?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 { return Err(WorkerError("worker_already_running")); }
-    emit(&output, json!({"event":"ready","connected":false,"network_contacted":false})).await;
+    emit(&output, ready_event()).await;
     let mut input = BufReader::new(tokio::io::stdin());
     while let Some(line) = bounded_line(&mut input).await? {
         let command = match parse_command(&line) {
@@ -698,6 +807,169 @@ mod tests {
             participants: vec!["mailto:buddy@example.test".into(), "mailto:family@example.test".into()],
             sender_guid: None, cv_name: None, after_guid: None }, question: "Dinner?".into(),
             options: vec!["Pizza".into(), "Sushi".into()] }
+    }
+
+    #[test]
+    fn ready_advertises_typing_without_connection_or_private_identifiers() {
+        assert_eq!(ready_event(), json!({"event":"ready","connected":false,"network_contacted":false,
+            "capabilities":{"typing":true,"feedback":true}}));
+    }
+
+    fn feedback_command() -> Command {
+        let Command::PreparePoll { conversation, .. } = poll_command() else { panic!("Expected synthetic conversation") };
+        Command::SendFeedback { id: "synthetic-feedback".into(), conversation, text: "I'm working on it.".into() }
+    }
+
+    #[test]
+    fn feedback_intent_is_durable_before_io_and_keeps_normal_text_wire_semantics() {
+        let directory = PrivateTestDirectory::new();
+        let mut worker = offline_worker(&directory.0);
+        let first = worker.prepare(&feedback_command()).unwrap();
+        assert!(first.feedback);
+        assert_eq!(first.status, "prepared");
+        assert!(first.message.has_payload());
+        assert_eq!(first.message.message.get_nr(), None);
+        assert!(first.message.send_delivered);
+        let Message::Message(normal) = &first.message.message else { panic!("Expected ordinary text") };
+        assert_eq!(normal.plain_feedback_text(), Some("I'm working on it."));
+        assert_eq!(serde_json::to_value(normal).unwrap(),
+            serde_json::to_value(NormalMessage::new("I'm working on it.".into(), MessageType::IMessage)).unwrap());
+        let loaded = load_operation(&directory.0, "synthetic-feedback").unwrap();
+        assert_eq!(loaded.message.id, first.message.id);
+        assert_eq!(loaded.fingerprint, first.fingerprint);
+        let mut ordinary = serde_json::to_value(&loaded).unwrap();
+        ordinary.as_object_mut().unwrap().remove("feedback");
+        assert!(!serde_json::from_value::<Operation>(ordinary).unwrap().feedback);
+    }
+
+    #[test]
+    fn feedback_rejects_oversized_empty_or_group_content_without_operation_records() {
+        let directory = PrivateTestDirectory::new();
+        let mut worker = offline_worker(&directory.0);
+        for text in [" ".to_string(), "x".repeat(MAX_FEEDBACK_BYTES + 1), "λ".repeat(MAX_FEEDBACK_BYTES)] {
+            let mut command = feedback_command();
+            let Command::SendFeedback { text: value, .. } = &mut command else { panic!("Expected feedback") };
+            *value = text;
+            assert!(matches!(worker.prepare(&command), Err(WorkerError("invalid_feedback_text"))));
+        }
+        let mut command = feedback_command();
+        let Command::SendFeedback { conversation, .. } = &mut command else { panic!("Expected feedback") };
+        conversation.participants.push("mailto:third@example.test".into());
+        assert!(matches!(worker.prepare(&command), Err(WorkerError("invalid_typing_conversation"))));
+        assert!(worker.operations.lock().unwrap().is_empty());
+        assert!(!operation_path(&directory.0, "synthetic-feedback").unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn feedback_timeout_keeps_same_durable_guid_and_never_runs_tail_or_overwrites_retry() {
+        let directory = PrivateTestDirectory::new();
+        let mut worker = offline_worker(&directory.0);
+        let command = feedback_command();
+        let mut operation = worker.prepare(&command).unwrap();
+        let guid = operation.message.id.clone();
+        start_feedback(&directory.0, &mut operation).unwrap();
+        let persisted = load_operation(&directory.0, "synthetic-feedback").unwrap();
+        assert_eq!(persisted.status, "dispatching");
+        assert_eq!(persisted.message.id, guid);
+        let tail = Arc::new(AtomicBool::new(false));
+        let late_tail = tail.clone();
+        let future = async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            late_tail.store(true, Ordering::SeqCst);
+            Ok::<_, WorkerError>(SendDiagnostics::default())
+        };
+        let diagnostics = feedback_diagnostics(future, Duration::from_millis(1)).await;
+        assert_eq!(diagnostics.job_state, SendJobState::ClientTimedOut);
+        finish_feedback(&directory.0, &mut operation, diagnostics).unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(!tail.load(Ordering::SeqCst));
+        let started = Arc::new(AtomicBool::new(false));
+        let started_future = started.clone();
+        let expired = feedback_diagnostics(async move {
+            started_future.store(true, Ordering::SeqCst);
+            Ok::<_, WorkerError>(SendDiagnostics::default())
+        }, Duration::ZERO).await;
+        assert_eq!(expired.job_state, SendJobState::ClientTimedOut);
+        assert!(!started.load(Ordering::SeqCst));
+        let before = private_read(&operation_path(&directory.0, "synthetic-feedback").unwrap(), MAX_COMMAND_BYTES).unwrap();
+        let retried = worker.prepare(&command).unwrap();
+        assert_eq!(retried.status, "uncertain");
+        assert_eq!(retried.message.id, guid);
+        assert!(start_feedback(&directory.0, &mut operation).is_err());
+        let mut changed = command.clone();
+        let Command::SendFeedback { text, .. } = &mut changed else { panic!("Expected feedback") };
+        text.push_str(" changed");
+        assert!(matches!(worker.prepare(&changed), Err(WorkerError("operation_conflict"))));
+        assert_eq!(private_read(&operation_path(&directory.0, "synthetic-feedback").unwrap(), MAX_COMMAND_BYTES).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn feedback_requires_positive_external_result_and_releases_after_bounded_observation() {
+        let directory = PrivateTestDirectory::new();
+        let mut worker = offline_worker(&directory.0);
+        let mut operation = worker.prepare(&feedback_command()).unwrap();
+        start_feedback(&directory.0, &mut operation).unwrap();
+        let no_confirmation = SendDiagnostics { job_state: SendJobState::Completed, stream_closed: true,
+            ..SendDiagnostics::default() };
+        finish_feedback(&directory.0, &mut operation, no_confirmation).unwrap();
+        assert_eq!(operation.status, "uncertain");
+        let mut command = feedback_command();
+        let Command::SendFeedback { id, .. } = &mut command else { panic!("Expected feedback") };
+        *id = "confirmed-feedback".into();
+        let mut operation = worker.prepare(&command).unwrap();
+        start_feedback(&directory.0, &mut operation).unwrap();
+        let mut confirmed = SendDiagnostics { job_state: SendJobState::Completed, stream_closed: true,
+            ..SendDiagnostics::default() };
+        confirmed.record(TargetScope::External, TargetOutcome::Accepted);
+        let diagnostics = feedback_diagnostics(async { Ok::<_, WorkerError>(confirmed) }, Duration::from_secs(1)).await;
+        finish_feedback(&directory.0, &mut operation, diagnostics).unwrap();
+        assert_eq!(operation.status, "submitted");
+        assert_eq!(report_operation(&operation, "query")["delivery_verified"], false);
+    }
+
+    #[tokio::test]
+    async fn feedback_requires_connection_without_creating_an_intent() {
+        let directory = PrivateTestDirectory::new();
+        let mut worker = offline_worker(&directory.0);
+        assert!(matches!(worker.command(feedback_command()).await, Err(WorkerError("not_connected"))));
+        assert!(!operation_path(&directory.0, "synthetic-feedback").unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn typing_requires_connection_and_never_creates_durable_operations_offline() {
+        let directory = PrivateTestDirectory::new();
+        let mut worker = offline_worker(&directory.0);
+        let before: Vec<_> = fs::read_dir(&directory.0).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        for active in [true, false] {
+            let Command::PreparePoll { conversation, .. } = poll_command() else { panic!("Expected synthetic conversation") };
+            assert!(matches!(worker.command(Command::Typing { id: "typing-one".into(), conversation, active }).await,
+                Err(WorkerError("not_connected"))));
+        }
+        let after: Vec<_> = fs::read_dir(&directory.0).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(before, after);
+        assert!(worker.operations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn typing_send_timeout_drops_future_instead_of_running_late_or_retrying() {
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped { fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); } }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let sent = Arc::new(AtomicBool::new(false));
+        let guard = Dropped(dropped.clone());
+        let late_sent = sent.clone();
+        let future = async move {
+            let _guard = guard;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            late_sent.store(true, Ordering::SeqCst);
+            Ok::<(), WorkerError>(())
+        };
+        assert_eq!(typing_status(future, Duration::from_millis(1)).await, "uncertain");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(!sent.load(Ordering::SeqCst));
+        assert_eq!(typing_status(async { Ok::<(), WorkerError>(()) }, Duration::from_secs(1)).await, "submitted");
+        assert_eq!(typing_status(async { Err::<(), _>(WorkerError("synthetic")) }, Duration::from_secs(1)).await, "uncertain");
     }
 
     #[test]
