@@ -11,6 +11,7 @@ use prost::Message;
 use reqwest::{header::{HeaderMap, HeaderName}, Body, Client, Response};
 use sha2::Sha256;
 use tokio::task::JoinHandle;
+use tokio_util::task::AbortOnDropHandle;
 use uuid::Uuid;
 use async_trait::async_trait;
 use serde::{Serialize, Deserialize};
@@ -246,11 +247,15 @@ pub async fn prepare_put_v2(mut reader: impl ReadContainer + Send + Sync, bounda
 
 // a `Container` that transfers to an MMCS bucket
 // handles putting into a bucket
+pub fn own_upload_task<T>(task: JoinHandle<T>) -> AbortOnDropHandle<T> {
+    AbortOnDropHandle::new(task)
+}
+
 struct MMCSPutContainer {
     target: UploadTarget,
     hasher: Hasher,
     sender: Option<flume::Sender<Result<Vec<u8>, PushError>>>,
-    finalize: Option<JoinHandle<Result<Response, PushError>>>,
+    finalize: Option<AbortOnDropHandle<Result<Response, PushError>>>,
     length: usize,
     transfer_progress: usize,
     finish_binary: Option<Vec<u8>>,
@@ -293,7 +298,9 @@ impl MMCSPutContainer {
                 let response = transfer_mmcs_container(&REQWEST_NO_TIMEOUT, &request, Some(body), &user_agent).await?;
                 Ok::<_, PushError>(response)
             });
-            self.finalize = Some(task);
+            // Dropping a cancelled/timed-out transfer, including while this
+            // handle is being awaited, must not detach its HTTP upload.
+            self.finalize = Some(own_upload_task(task));
 
         }
     }
