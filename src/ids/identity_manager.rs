@@ -950,7 +950,22 @@ impl IdentityResource {
         self.cache.lock().await.invalidate_all();
     }
 
-    pub async fn send_message(&self, topic: &'static str, ids_message: IDSSendMessage, mut message_targets: Vec<DeliveryHandle>) -> Result<SendJob, PushError> {
+    pub async fn send_message(&self, topic: &'static str, ids_message: IDSSendMessage, message_targets: Vec<DeliveryHandle>) -> Result<SendJob, PushError> {
+        self.send_message_internal(topic, ids_message, message_targets, false).await
+    }
+
+    /// Only unqueued no-response events may use the cancellation-safe path.
+    /// Counters/cache writes already performed are retained on cancellation.
+    pub async fn send_transient_message(&self, topic: &'static str, ids_message: IDSSendMessage,
+        message_targets: Vec<DeliveryHandle>) -> Result<SendJob, PushError> {
+        if !ids_message.no_response || ids_message.queue_id.is_some() || ids_message.scheduled_ms.is_some() {
+            return Err(PushError::BadMsg);
+        }
+        self.send_message_internal(topic, ids_message, message_targets, true).await
+    }
+
+    async fn send_message_internal(&self, topic: &'static str, ids_message: IDSSendMessage,
+        mut message_targets: Vec<DeliveryHandle>, transient: bool) -> Result<SendJob, PushError> {
 
         if ids_message.scheduled_ms.is_some() && ids_message.queue_id.is_none() {
             return Err(PushError::BadMsg);
@@ -987,6 +1002,14 @@ impl IdentityResource {
             topic,
             sent_timestamp: since_the_epoch.as_millis() as u64,
         };
+
+        if transient {
+            // No task is spawned here: timeout drops the complete send future.
+            // APNs bytes already submitted cannot be recalled, but no delayed
+            // task or outer retry remains to transmit after the worker reply.
+            job.send_targets(message_targets, 0).await?;
+            return Ok(SendJob { process: receiver, handle: None });
+        }
 
         let mut job_spawned = tokio::spawn(job.send_targets(message_targets, 0));
 

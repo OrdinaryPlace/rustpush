@@ -7,6 +7,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, atomic::{AtomicBool, Ordering}};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::future::Future;
 
 use buddy_imessage::*;
 use keystore::{init_keystore, software::{NoEncryptor, SoftwareKeystore, SoftwareKeystoreState}};
@@ -60,6 +61,20 @@ struct Worker {
     initialized: bool,
     persistence_failed: Arc<AtomicBool>,
     operations: Arc<Mutex<HashMap<String, Operation>>>,
+}
+
+const TYPING_SEND_BUDGET: Duration = Duration::from_secs(2);
+
+fn ready_event() -> Value {
+    json!({"event":"ready","connected":false,"network_contacted":false,"capabilities":{"typing":true}})
+}
+
+async fn typing_status<F, E>(send: F, budget: Duration) -> &'static str
+where F: Future<Output = std::result::Result<(), E>> {
+    match tokio::time::timeout(budget, send).await {
+        Ok(Ok(())) => "submitted",
+        _ => "uncertain",
+    }
 }
 
 fn plist_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
@@ -402,6 +417,19 @@ impl Worker {
                 emit(&self.output, json!({"event":"disconnected","id":id,"request_id":id})).await;
                 return Ok(false);
             }
+            Command::Typing { conversation, active, .. } => {
+                let connected = self.connected.as_ref().ok_or(WorkerError("not_connected"))?;
+                if self.persistence_failed.load(Ordering::SeqCst) { return Err(WorkerError("state_persist_failed")); }
+                validate_typing_conversation(conversation, &connected.actor, &[connected.actor.clone()])?;
+                let send = async {
+                    let own_handles = connected.client.identity.get_handles().await;
+                    let mut message = typing_message(conversation, *active, &connected.actor, &own_handles)?;
+                    connected.client.send_typing(&mut message).await.map_err(|_| WorkerError("typing_send_failed"))
+                };
+                let status = typing_status(send, TYPING_SEND_BUDGET).await;
+                let status = if self.persistence_failed.load(Ordering::SeqCst) { "uncertain" } else { status };
+                emit(&self.output, json!({"event":"typing","id":id,"request_id":id,"active":active,"status":status})).await;
+            }
             Command::Status { operation_id, .. } => emit(&self.output, report_operation(&load_operation(&self.work_dir, operation_id)?, &id)).await,
             Command::PrepareText { .. } | Command::PreparePoll { .. } => {
                 let operation = self.prepare(&command)?;
@@ -622,7 +650,7 @@ async fn run(output: mpsc::Sender<Value>) -> Result<()> {
     let lock = OpenOptions::new().read(true).write(true).create(true).mode(0o600).custom_flags(libc::O_NOFOLLOW)
         .open(work_dir.join("worker.lock")).map_err(|_| WorkerError("worker_lock_failed"))?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 { return Err(WorkerError("worker_already_running")); }
-    emit(&output, json!({"event":"ready","connected":false,"network_contacted":false})).await;
+    emit(&output, ready_event()).await;
     let mut input = BufReader::new(tokio::io::stdin());
     while let Some(line) = bounded_line(&mut input).await? {
         let command = match parse_command(&line) {
@@ -698,6 +726,49 @@ mod tests {
             participants: vec!["mailto:buddy@example.test".into(), "mailto:family@example.test".into()],
             sender_guid: None, cv_name: None, after_guid: None }, question: "Dinner?".into(),
             options: vec!["Pizza".into(), "Sushi".into()] }
+    }
+
+    #[test]
+    fn ready_advertises_typing_without_connection_or_private_identifiers() {
+        assert_eq!(ready_event(), json!({"event":"ready","connected":false,"network_contacted":false,
+            "capabilities":{"typing":true}}));
+    }
+
+    #[tokio::test]
+    async fn typing_requires_connection_and_never_creates_durable_operations_offline() {
+        let directory = PrivateTestDirectory::new();
+        let mut worker = offline_worker(&directory.0);
+        let before: Vec<_> = fs::read_dir(&directory.0).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        for active in [true, false] {
+            let Command::PreparePoll { conversation, .. } = poll_command() else { panic!("Expected synthetic conversation") };
+            assert!(matches!(worker.command(Command::Typing { id: "typing-one".into(), conversation, active }).await,
+                Err(WorkerError("not_connected"))));
+        }
+        let after: Vec<_> = fs::read_dir(&directory.0).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(before, after);
+        assert!(worker.operations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn typing_send_timeout_drops_future_instead_of_running_late_or_retrying() {
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped { fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); } }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let sent = Arc::new(AtomicBool::new(false));
+        let guard = Dropped(dropped.clone());
+        let late_sent = sent.clone();
+        let future = async move {
+            let _guard = guard;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            late_sent.store(true, Ordering::SeqCst);
+            Ok::<(), WorkerError>(())
+        };
+        assert_eq!(typing_status(future, Duration::from_millis(1)).await, "uncertain");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(!sent.load(Ordering::SeqCst));
+        assert_eq!(typing_status(async { Ok::<(), WorkerError>(()) }, Duration::from_secs(1)).await, "submitted");
+        assert_eq!(typing_status(async { Err::<(), _>(WorkerError("synthetic")) }, Duration::from_secs(1)).await, "uncertain");
     }
 
     #[test]

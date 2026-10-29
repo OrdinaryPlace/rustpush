@@ -314,6 +314,18 @@ impl IMClient {
     }
 
     pub async fn send(&self, message: &mut MessageInst) -> Result<SendJob, PushError> {
+        self.send_internal(message, false).await
+    }
+
+    /// Await transient typing directly so cancelling a bounded worker request
+    /// cannot detach a send job that later shows a stale typing indicator.
+    pub async fn send_typing(&self, message: &mut MessageInst) -> Result<(), PushError> {
+        if !matches!(&message.message, Message::Typing(_, None)) { return Err(PushError::BadMsg); }
+        self.send_internal(message, true).await?;
+        Ok(())
+    }
+
+    async fn send_internal(&self, message: &mut MessageInst, transient: bool) -> Result<SendJob, PushError> {
         let handles = self.identity.get_handles().await;
 
         let topic = if message.message.is_sms() { "com.apple.private.alloy.sms" } else { "com.apple.madrid" };
@@ -359,7 +371,11 @@ impl IMClient {
 
         let ids_message = message.get_ids(&my_handles, &self.conn, true).await?;
 
-        self.identity.send_message(topic, ids_message, message_targets).await
+        if transient {
+            self.identity.send_transient_message(topic, ids_message, message_targets).await
+        } else {
+            self.identity.send_message(topic, ids_message, message_targets).await
+        }
     }
 }
 

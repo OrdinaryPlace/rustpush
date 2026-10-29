@@ -87,6 +87,7 @@ startup failures have a null `request_id`; detailed input is never echoed.
 ```json
 {"op":"validate","id":"check-1"}
 {"op":"connect","id":"connect-1"}
+{"op":"typing","id":"typing-1","conversation":{"participants":["mailto:buddy@example.test","mailto:family@example.test"]},"active":true}
 {"op":"send_text","id":"stable-action-1","conversation":{"participants":["mailto:buddy@example.test","mailto:family@example.test"]},"text":"Hello"}
 {"op":"send_poll","id":"stable-poll-1","conversation":{"participants":["mailto:buddy@example.test","mailto:family@example.test"]},"question":"Dinner?","options":["Pizza","Sushi"]}
 {"op":"status","id":"query-1","operation_id":"stable-poll-1"}
@@ -98,6 +99,28 @@ conversations use the actual verified own handle and exact participants.
 Optional conversation fields are `sender_guid`, `cv_name`, and `after_guid`;
 UUID fields must be valid. No SMS fallback, recipient override, arbitrary actor,
 vote-spoofing interface, or native vote-removal command is provided.
+
+Ready events advertise `capabilities.typing:true`. Older workers without that
+flag do not support the command. Typing requires an existing connection and an
+exact direct conversation containing the connected own actor and one external
+peer. Only the host chooses that approved audience. `active:false` stops typing;
+app icons, sender overrides, text and message GUIDs are not accepted. The response
+is `event:"typing"`, matching `id`/`request_id`, the requested `active` boolean,
+and `status:"submitted"` or `"uncertain"`.
+
+Typing has a two-second total send budget, uses a directly awaited send path
+without a detached send job, and never creates a durable message operation or
+replays after restart. Bytes already submitted to APNs cannot be recalled.
+`submitted` indicates protocol submission only: typing has no IDS delivery
+confirmation and no phone-rendering claim. Failures/timeouts remain uncertain
+and are not retried. Host leases, refreshes and best-effort stops determine its
+lifecycle; no recipient-device typing TTL is established here.
+
+Transient operation records do not imply state-free transport. A plain direct
+typing start has no encrypted payload, while stop has an encrypted payload and
+advances the existing per-device NGM counters normally. Recipient lookup can also
+update the existing key cache. Cancellation never rolls back those counters or
+creates a replacement identity.
 
 `prepare_text` and `prepare_poll` accept the same data as their `send_` variants
 but only create a private durable intent offline. Use

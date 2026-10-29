@@ -5,8 +5,14 @@ name: Buddy Linux build
   push:
     branches: ["buddy/**"]
   pull_request:
-    branches: ["buddy/native-polls"]
+    branches: ["buddy/native-polls", "buddy/send-diagnostics"]
   workflow_dispatch:
+    inputs:
+      export_release:
+        description: Export the tested public worker bundle as a source/run-bound prerelease
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -14,12 +20,13 @@ permissions:
 jobs:
   linux:
     name: Debian 12 worker and poll codec
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.export_release }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    env:
+    env: &worker-build-environment
       BUDDY_CI_IMAGE: buddy-linux-builder:${{ github.run_id }}-${{ github.run_attempt }}
       BUDDY_CI_CONTAINER: buddy-linux-builder-${{ github.run_id }}-${{ github.run_attempt }}
-    steps:
+    steps: &worker-build-steps
       - name: Check out public source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -195,6 +202,7 @@ jobs:
           PY
 
       - name: Upload tested Linux artifact
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.export_release }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: buddy-linux-amd64-${{ github.sha }}
@@ -203,9 +211,56 @@ jobs:
           retention-days: 14
           compression-level: 6
 
+      - name: Export tested public bundle without artifact storage
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.export_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = OrdinaryPlace/rustpush
+          test "$GITHUB_REF" = refs/heads/buddy/send-diagnostics
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          [[ "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
+          cd "$RUNNER_TEMP/buddy-artifact"
+          sha256sum -c SHA256SUMS >/dev/null
+          jq -e --arg source "$GITHUB_SHA" '
+            .repository=="OrdinaryPlace/rustpush" and .commit==$source and
+            .target=="x86_64-unknown-linux-gnu" and .builder_libc=="glibc 2.36" and
+            .account_state_or_runtime_apple_binary_supplied==false and .test_networks=={}
+          ' build-metadata.json >/dev/null
+          asset="buddy-linux-amd64-${GITHUB_SHA}-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar.gz"
+          tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+            -czf "$RUNNER_TEMP/$asset" .
+          cd "$RUNNER_TEMP"
+          sha256sum "$asset" > "$asset.sha256"
+          manifest_sha=$(sha256sum buddy-artifact/SHA256SUMS | cut -d ' ' -f1)
+          bundle_sha=$(sha256sum "$asset" | cut -d ' ' -f1)
+          tag="buddy-worker-${GITHUB_SHA}-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          printf 'Public Linux/amd64 worker, licenses and build provenance only.\n\nSource: `%s`\nRun: %s/%s/actions/runs/%s\nArtifact manifest SHA256: `%s`\nBundle SHA256: `%s`\nNo private state, runtime Apple resource or account credentials.\n' \
+            "$GITHUB_SHA" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" \
+            "$manifest_sha" "$bundle_sha" > worker-release-notes.md
+          gh release create "$tag" "$asset" "$asset.sha256" \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --latest=false \
+            --title "Buddy worker ${GITHUB_SHA:0:12} (run $GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT)" \
+            --notes-file worker-release-notes.md
+
       - name: Remove this job's builder container
         if: always()
         run: |
           if docker container inspect "$BUDDY_CI_CONTAINER" >/dev/null 2>&1; then
             docker rm --force "$BUDDY_CI_CONTAINER"
           fi
+
+  release-export:
+    name: Owner-requested public worker export
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.export_release && github.repository == 'OrdinaryPlace/rustpush' && github.ref == 'refs/heads/buddy/send-diagnostics' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env: *worker-build-environment
+    # The same source build, network disconnect, offline tests and provenance
+    # checks run before export. PR/push builds retain read-only permissions.
+    steps: *worker-build-steps
