@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+pub mod media;
+
 pub const MAX_EXPORT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_COMMAND_BYTES: usize = 128 * 1024;
 pub const MAX_FEEDBACK_BYTES: usize = 1000;
@@ -265,6 +267,7 @@ pub enum Command {
     SendPoll { id: String, conversation: Conversation, question: String, options: Vec<String> },
     PrepareText { id: String, conversation: Conversation, text: String },
     PreparePoll { id: String, conversation: Conversation, question: String, options: Vec<String> },
+    PrepareImage { id: String, conversation: Conversation, artifact_id: String },
     Dispatch { id: String, operation_id: String },
 }
 
@@ -275,7 +278,7 @@ impl Command {
             | Self::Typing { id, .. }
             | Self::Status { id, .. } | Self::SendText { id, .. } | Self::SendPoll { id, .. }
             | Self::SendFeedback { id, .. }
-            | Self::PrepareText { id, .. } | Self::PreparePoll { id, .. } | Self::Dispatch { id, .. } => id,
+            | Self::PrepareText { id, .. } | Self::PreparePoll { id, .. } | Self::PrepareImage { id, .. } | Self::Dispatch { id, .. } => id,
         }
     }
 }

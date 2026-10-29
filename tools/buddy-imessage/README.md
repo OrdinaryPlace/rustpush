@@ -143,6 +143,47 @@ after explicit connection to dispatch a prepared operation. A `prepare_` and a
 `send_` command with the same ID have different fingerprints; dispatch the
 prepared record rather than changing its operation.
 
+## Approved image artifacts
+
+`capabilities.images:true` advertises `prepare_image`, followed by the existing
+`dispatch`/`status` operations. This is delivery support, not image generation.
+The host must authorize the original requester and exact direct audience and
+import an approved image into the fixed private spool before preparation:
+
+```json
+{"op":"prepare_image","id":"stable-image-1","conversation":{"participants":["mailto:buddy@example.test","mailto:family@example.test"]},"artifact_id":"image_0123456789abcdef"}
+```
+
+Only `<work-dir>/outbound-media/<artifact_id>.json` and matching `.bin` are read.
+An ID has 16–64 lowercase ASCII letters, digits, `_` or `-`. The manifest has
+exactly `format:1`, `artifact_id`, lowercase `sha256`, `mime`, byte `size` and
+the exact `participants`. No command/manifest accepts a file path, URL, actor,
+filename, MIME override or arbitrary payload. The host registry must bind this
+artifact to its authorized person/chat/source; the worker independently checks
+its bytes, metadata and destination. Directories are owner-only 0700 and files
+owner-only 0600, regular, opened NOFOLLOW/NONBLOCK and with no hard links.
+
+Initial policy supports PNG/JPEG up to 10 MiB, 8192 pixels per dimension and
+16,000,000 pixels total. PNG signature/chunk bounds/CRC/IHDR/IDAT/IEND and JPEG
+SOI/SOF/SOS/EOI framing/dimensions are checked. These are bounded format checks,
+not a promise that every image decodes or renders correctly on a phone.
+MIME, UTI and safe `image.png`/`image.jpg` names are derived by the worker.
+
+Preparation remains offline and persists the same native GUID/content binding.
+Dispatch snapshots and rechecks the approved bytes, actor and audience, then
+persists `dispatching` before its 60-second MMCS upload budget. Upload HTTP
+tasks are abort-owned, including when the parent future is dropped. The private
+encrypted attachment descriptor is persisted before the ordinary same-GUID IDS
+send. Upload failure, timeout or crash remains uncertain; dispatch is never
+permission to reupload or resend an attempted operation. Retain the spool until
+the host has reconciled its operation; status reads need no artifact file.
+
+Operation reports add only `image:{artifact_id,sha256,mime,size,width,height}`.
+MMCS URLs, encryption keys, signatures, file paths and bytes are never returned
+or logged. Upload success is separate from native submission, positive peer
+receipt and human-confirmed image rendering. Existing text/poll sends retain
+their documented observation limits and coupled NGM counter handling.
+
 ## Delivery and restart rules
 
 Before any send, the worker persists the exact message GUID, conversation,
