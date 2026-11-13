@@ -542,11 +542,11 @@ impl Worker {
             save_operation(&self.work_dir, &operation)?;
         }
         if let Some(bytes) = attachment_bytes {
-            let binding = operation.attachment.as_ref().ok_or(WorkerError("invalid_operation_record"))?;
+            let media_type = operation.attachment.as_ref().ok_or(WorkerError("invalid_operation_record"))?.mime;
             let upload = async {
                 let prepared = rustpush::MMCSFile::prepare_put(std::io::Cursor::new(&bytes)).await?;
                 rustpush::Attachment::new_mmcs(&connected.connection, &prepared, std::io::Cursor::new(&bytes),
-                    binding.mime.mime(), binding.mime.uti(), binding.mime.name(), |_, _| {}).await
+                    media_type.mime(), media_type.uti(), media_type.name(), |_, _| {}).await
             };
             if !store_media_upload(&self.work_dir, &mut operation, MEDIA_UPLOAD_BUDGET, upload).await? { return Ok(operation); }
             if self.persistence_failed.load(Ordering::SeqCst) { return Err(WorkerError("state_persist_failed")); }
