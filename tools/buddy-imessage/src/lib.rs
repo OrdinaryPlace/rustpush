@@ -268,6 +268,7 @@ pub enum Command {
     PrepareText { id: String, conversation: Conversation, text: String },
     PreparePoll { id: String, conversation: Conversation, question: String, options: Vec<String> },
     PrepareImage { id: String, conversation: Conversation, artifact_id: String },
+    PrepareMedia { id: String, conversation: Conversation, artifact_id: String },
     Dispatch { id: String, operation_id: String },
 }
 
@@ -278,7 +279,8 @@ impl Command {
             | Self::Typing { id, .. }
             | Self::Status { id, .. } | Self::SendText { id, .. } | Self::SendPoll { id, .. }
             | Self::SendFeedback { id, .. }
-            | Self::PrepareText { id, .. } | Self::PreparePoll { id, .. } | Self::PrepareImage { id, .. } | Self::Dispatch { id, .. } => id,
+            | Self::PrepareText { id, .. } | Self::PreparePoll { id, .. } | Self::PrepareImage { id, .. }
+            | Self::PrepareMedia { id, .. } | Self::Dispatch { id, .. } => id,
         }
     }
 }

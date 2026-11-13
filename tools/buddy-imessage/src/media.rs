@@ -1,4 +1,4 @@
-//! Fixed-spool image artifacts. Callers never choose a filesystem path or URL.
+//! Fixed-spool attachment artifacts. Callers never choose a filesystem path or URL.
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -7,19 +7,21 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use crate::{Conversation, Result, WorkerError, require_private_directory};
 
-pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+pub const MAX_MEDIA_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_IMAGE_DIMENSION: u32 = 8192;
 pub const MAX_IMAGE_PIXELS: u64 = 16_000_000;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ImageBinding {
+pub struct MediaBinding {
     pub artifact_id: String,
     pub sha256: String,
-    pub mime: String,
+    pub mime: MediaType,
     pub size: u64,
-    pub width: u32,
-    pub height: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -28,9 +30,38 @@ struct Manifest {
     format: u32,
     artifact_id: String,
     sha256: String,
-    mime: String,
+    mime: MediaType,
     size: u64,
     participants: Vec<String>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MediaType {
+    #[serde(rename = "image/png")]
+    Png,
+    #[serde(rename = "image/jpeg")]
+    Jpeg,
+    #[serde(rename = "audio/mp4")]
+    M4a,
+    #[serde(rename = "video/mp4")]
+    Mp4,
+}
+
+impl MediaType {
+    pub fn is_image(self) -> bool { matches!(self, Self::Png | Self::Jpeg) }
+
+    pub fn mime(self) -> &'static str {
+        match self { Self::Png => "image/png", Self::Jpeg => "image/jpeg", Self::M4a => "audio/mp4", Self::Mp4 => "video/mp4" }
+    }
+
+    // Apple Uniform Type Identifiers for the compatible attachment formats.
+    pub fn uti(self) -> &'static str {
+        match self { Self::Png => "public.png", Self::Jpeg => "public.jpeg", Self::M4a => "public.mpeg-4-audio", Self::Mp4 => "public.mpeg-4" }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self { Self::Png => "image.png", Self::Jpeg => "image.jpg", Self::M4a => "audio.m4a", Self::Mp4 => "video.mp4" }
+    }
 }
 
 fn artifact_id(value: &str) -> bool {
@@ -39,16 +70,16 @@ fn artifact_id(value: &str) -> bool {
 
 fn read_file(path: &Path, limit: usize) -> Result<Vec<u8>> {
     let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)
-        .map_err(|_| WorkerError("invalid_image_artifact"))?;
-    let info = file.metadata().map_err(|_| WorkerError("invalid_image_artifact"))?;
+        .map_err(|_| WorkerError("invalid_media_artifact"))?;
+    let info = file.metadata().map_err(|_| WorkerError("invalid_media_artifact"))?;
     if !info.is_file() || info.uid() != unsafe { libc::geteuid() } || info.mode() & 0o777 != 0o600
         || info.nlink() != 1 || info.len() > limit as u64 {
-        return Err(WorkerError("invalid_image_artifact"));
+        return Err(WorkerError("invalid_media_artifact"));
     }
     let mut bytes = Vec::new();
     Read::by_ref(&mut file).take(limit as u64 + 1).read_to_end(&mut bytes)
-        .map_err(|_| WorkerError("invalid_image_artifact"))?;
-    if bytes.len() > limit { return Err(WorkerError("invalid_image_artifact")); }
+        .map_err(|_| WorkerError("invalid_media_artifact"))?;
+    if bytes.len() > limit { return Err(WorkerError("invalid_media_artifact")); }
     Ok(bytes)
 }
 
@@ -126,33 +157,77 @@ fn jpeg(bytes: &[u8]) -> Result<(u32, u32)> {
     Err(WorkerError("invalid_image_format"))
 }
 
-pub fn read_artifact(directory: &Path, id: &str, conversation: &Conversation) -> Result<(ImageBinding, Vec<u8>)> {
-    if !artifact_id(id) { return Err(WorkerError("invalid_image_artifact")); }
+const INVALID_MP4: WorkerError = WorkerError("invalid_mp4_format");
+
+fn mp4_box<'a>(remaining: &mut &'a [u8]) -> Result<(&'a [u8], &'a [u8])> {
+    let header = remaining.get(..8).ok_or(INVALID_MP4)?;
+    let size = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+    // Normalized files are at most 10 MiB, so extended sizes are unnecessary.
+    if size < 8 || size > remaining.len() { return Err(INVALID_MP4); }
+    let (current, rest) = remaining.split_at(size);
+    *remaining = rest;
+    Ok((&current[4..8], &current[8..]))
+}
+
+fn mp4_child<'a>(mut parent: &'a [u8], kind: &[u8]) -> Result<&'a [u8]> {
+    let mut result = None;
+    while !parent.is_empty() {
+        let (name, data) = mp4_box(&mut parent)?;
+        if name == kind && result.replace(data).is_some() { return Err(INVALID_MP4); }
+    }
+    result.ok_or(INVALID_MP4)
+}
+
+fn mp4(mut bytes: &[u8], video: bool) -> Result<()> {
+    let (kind, brands) = mp4_box(&mut bytes)?;
+    if kind != b"ftyp" || brands.len() < 8 || brands.len() % 4 != 0
+        || !matches!(&brands[..4], b"isom" | b"M4A " | b"mp41" | b"mp42") {
+        return Err(INVALID_MP4);
+    }
+    if mp4_child(bytes, b"mdat")?.is_empty() { return Err(INVALID_MP4); }
+    let mut movie = mp4_child(bytes, b"moov")?;
+    let mut tracks = (0u8, 0u8);
+    while !movie.is_empty() {
+        let (name, track) = mp4_box(&mut movie)?;
+        if name != b"trak" { continue; }
+        let media = mp4_child(track, b"mdia")?;
+        let handler = mp4_child(media, b"hdlr")?;
+        match handler.get(8..12) {
+            Some(b"soun") if tracks.0 == 0 => tracks.0 += 1,
+            Some(b"vide") if video && tracks.1 == 0 => tracks.1 += 1,
+            _ => return Err(INVALID_MP4),
+        }
+    }
+    if (video && tracks.1 == 1) || (!video && tracks.0 == 1) { Ok(()) } else { Err(INVALID_MP4) }
+}
+
+pub fn read_artifact(directory: &Path, id: &str, conversation: &Conversation) -> Result<(MediaBinding, Vec<u8>)> {
+    if !artifact_id(id) { return Err(WorkerError("invalid_media_artifact")); }
     require_private_directory(directory)?;
     let spool = directory.join("outbound-media");
     require_private_directory(&spool)?;
     let manifest: Manifest = serde_json::from_slice(&read_file(&spool.join(format!("{id}.json")), 16 * 1024)?)
-        .map_err(|_| WorkerError("invalid_image_artifact"))?;
+        .map_err(|_| WorkerError("invalid_media_artifact"))?;
     let mut recipients = manifest.participants.clone(); recipients.sort();
     let mut expected = conversation.participants.clone(); expected.sort();
     if manifest.format != 1 || manifest.artifact_id != id || recipients != expected || recipients.len() != 2
-        || recipients[0] == recipients[1] || manifest.size == 0 || manifest.size > MAX_IMAGE_BYTES as u64
+        || recipients[0] == recipients[1] || manifest.size == 0 || manifest.size > MAX_MEDIA_BYTES as u64
         || manifest.sha256.len() != 64 || !manifest.sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
-        return Err(WorkerError("invalid_image_artifact"));
+        return Err(WorkerError("invalid_media_artifact"));
     }
-    let bytes = read_file(&spool.join(format!("{id}.bin")), MAX_IMAGE_BYTES)?;
+    let bytes = read_file(&spool.join(format!("{id}.bin")), MAX_MEDIA_BYTES)?;
     if bytes.len() as u64 != manifest.size || format!("{:x}", Sha256::digest(&bytes)) != manifest.sha256 {
-        return Err(WorkerError("image_artifact_changed"));
+        return Err(WorkerError("media_artifact_changed"));
     }
-    let (width,height) = match manifest.mime.as_str() {
-        "image/png" => png(&bytes)?, "image/jpeg" => jpeg(&bytes)?, _ => return Err(WorkerError("invalid_image_format")),
+    let dimensions = match manifest.mime {
+        MediaType::Png => Some(png(&bytes)?),
+        MediaType::Jpeg => Some(jpeg(&bytes)?),
+        MediaType::M4a => { mp4(&bytes, false)?; None },
+        MediaType::Mp4 => { mp4(&bytes, true)?; None },
     };
-    Ok((ImageBinding { artifact_id: id.into(), sha256: manifest.sha256, mime: manifest.mime, size: manifest.size, width, height }, bytes))
-}
-
-impl ImageBinding {
-    pub fn uti(&self) -> &'static str { if self.mime == "image/png" { "public.png" } else { "public.jpeg" } }
-    pub fn name(&self) -> &'static str { if self.mime == "image/png" { "image.png" } else { "image.jpg" } }
+    let (width, height) = dimensions.unzip();
+    Ok((MediaBinding { artifact_id: id.into(), sha256: manifest.sha256, mime: manifest.mime,
+        size: manifest.size, width, height }, bytes))
 }
 
 #[cfg(test)]
@@ -186,8 +261,8 @@ mod tests {
         let (directory, mut conversation, _) = fixture();
         conversation.participants.reverse();
         let (binding, bytes) = read_artifact(&directory.0, ID, &conversation).unwrap();
-        assert_eq!((binding.width,binding.height,binding.size), (1,1,bytes.len() as u64));
-        assert_eq!((binding.uti(),binding.name()), ("public.png","image.png"));
+        assert_eq!((binding.width,binding.height,binding.size), (Some(1),Some(1),bytes.len() as u64));
+        assert_eq!((binding.mime.uti(),binding.mime.name()), ("public.png","image.png"));
         conversation.participants[0] = "tel:+15555550999".into();
         assert!(read_artifact(&directory.0, ID, &conversation).is_err());
     }
@@ -198,7 +273,7 @@ mod tests {
             assert!(read_artifact(&directory.0, id, &conversation).is_err());
         }
         for (key,value) in [("path", serde_json::json!("/state/auth.json")), ("sha256", serde_json::json!("0".repeat(64))),
-            ("size", serde_json::json!(0)), ("size", serde_json::json!(MAX_IMAGE_BYTES+1)),
+            ("size", serde_json::json!(0)), ("size", serde_json::json!(MAX_MEDIA_BYTES+1)),
             ("mime", serde_json::json!("image/jpeg")), ("mime", serde_json::json!("image/svg+xml"))] {
             let mut changed = manifest.clone(); changed[key] = value;
             write_manifest(&directory.0, &changed);
@@ -224,6 +299,28 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
         assert!(read_artifact(&directory.0, ID, &conversation).is_err());
     }
+    #[test]
+    fn mp4_binding_requires_a_track_of_the_declared_type() {
+        let (directory, conversation, mut manifest) = fixture();
+        for (fixture, mime, uti, name, other_mime) in [
+            (&include_bytes!("../fixtures/audio.m4a")[..], "audio/mp4", "public.mpeg-4-audio", "audio.m4a", "video/mp4"),
+            (&include_bytes!("../fixtures/video.mp4")[..], "video/mp4", "public.mpeg-4", "video.mp4", "audio/mp4"),
+        ] {
+            crate::atomic_private_write(&directory.0.join(format!("outbound-media/{ID}.bin")), fixture).unwrap();
+            manifest["sha256"] = serde_json::json!(format!("{:x}", Sha256::digest(fixture)));
+            manifest["size"] = serde_json::json!(fixture.len());
+            manifest["mime"] = serde_json::json!(mime);
+            write_manifest(&directory.0, &manifest);
+            let (binding, _) = read_artifact(&directory.0, ID, &conversation).unwrap();
+            assert_eq!((binding.mime.mime(),binding.mime.uti(),binding.mime.name()), (mime,uti,name));
+            assert_eq!((binding.width,binding.height), (None,None));
+            manifest["mime"] = serde_json::json!(other_mime);
+            write_manifest(&directory.0, &manifest);
+            assert!(read_artifact(&directory.0, ID, &conversation).is_err());
+            assert!(mp4(&fixture[..fixture.len()-1], mime == "video/mp4").is_err());
+        }
+    }
+
     #[test]
     fn dimensions_and_headers_reject_bombs_corruption_and_trailing_bytes() {
         for (width,height) in [(0,1),(1,0),(8193,1),(8192,8192)] { assert!(dimensions(width,height).is_err()); }
