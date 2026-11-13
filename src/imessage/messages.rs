@@ -2225,6 +2225,8 @@ pub struct MessageInst {
     pub send_delivered: bool,
     pub verification_failed: bool,
     pub certified_context: Option<CertifiedContext>,
+    #[serde(skip)]
+    pub authenticated_madrid_payload: bool,
 }
 
 impl MessageInst {
@@ -2240,6 +2242,7 @@ impl MessageInst {
             target: None,
             verification_failed: false,
             certified_context: None,
+            authenticated_madrid_payload: false,
         }
     }
 
@@ -2319,6 +2322,7 @@ impl MessageInst {
                     target: None,
                     verification_failed: false,
                     certified_context: None,
+                    authenticated_madrid_payload: false,
                 };
                 return message.get_ids(my_handles, apns, schedule).await;
             }

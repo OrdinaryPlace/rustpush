@@ -42,7 +42,7 @@ pub use icloud_auth::{DefaultAnisetteProvider, FetchedToken, PersistAccountData,
 
 pub use util::{DebugRwLock, DebugMutex};
 use activation::ActivationInfo;
-pub use aps::{APSConnectionResource, APSConnection, APSMessage, APSState};
+pub use aps::{APSConnectionResource, APSConnection, APSIngressSnapshot, APSMessage, APSSendGuard, APSState};
 use async_trait::async_trait;
 pub use auth::{request_update_account, TokenProviderState, UpdateAccountFinish, MobileMeDelegateResponse};
 pub use mmcs::{FileContainer, prepare_put};

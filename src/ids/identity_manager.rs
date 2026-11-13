@@ -835,6 +835,7 @@ impl IdentityResource {
             let decrypted = self.identity.decrypt_payload(ident.as_ref(), &encryption, &message)?;
             let ungzipped = ungzip(&decrypted).unwrap_or_else(|_| decrypted);
 
+            payload.authenticated_madrid_payload = *topic == "com.apple.madrid" && ident.is_some();
             payload.message_unenc = Some(MessageBody::Bytes(ungzipped));
         }
 
@@ -951,7 +952,7 @@ impl IdentityResource {
     }
 
     pub async fn send_message(&self, topic: &'static str, ids_message: IDSSendMessage, message_targets: Vec<DeliveryHandle>) -> Result<SendJob, PushError> {
-        self.send_message_internal(topic, ids_message, message_targets, false).await
+        self.send_message_internal(topic, ids_message, message_targets, false, None).await
     }
 
     /// Only unqueued no-response events may use the cancellation-safe path.
@@ -967,11 +968,17 @@ impl IdentityResource {
     pub async fn send_bounded_message(&self, topic: &'static str, ids_message: IDSSendMessage,
         message_targets: Vec<DeliveryHandle>) -> Result<SendJob, PushError> {
         if ids_message.queue_id.is_some() || ids_message.scheduled_ms.is_some() { return Err(PushError::BadMsg); }
-        self.send_message_internal(topic, ids_message, message_targets, true).await
+        self.send_message_internal(topic, ids_message, message_targets, true, None).await
+    }
+
+    pub(crate) async fn send_guarded_message(&self, topic: &'static str, ids_message: IDSSendMessage,
+        message_targets: Vec<DeliveryHandle>, guard: crate::APSSendGuard) -> Result<SendJob, PushError> {
+        if ids_message.queue_id.is_some() || ids_message.scheduled_ms.is_some() { return Err(PushError::BadMsg); }
+        self.send_message_internal(topic, ids_message, message_targets, true, Some(guard)).await
     }
 
     async fn send_message_internal(&self, topic: &'static str, ids_message: IDSSendMessage,
-        mut message_targets: Vec<DeliveryHandle>, transient: bool) -> Result<SendJob, PushError> {
+        mut message_targets: Vec<DeliveryHandle>, transient: bool, guard: Option<crate::APSSendGuard>) -> Result<SendJob, PushError> {
 
         if ids_message.scheduled_ms.is_some() && ids_message.queue_id.is_none() {
             return Err(PushError::BadMsg);
@@ -1007,6 +1014,7 @@ impl IdentityResource {
             status: sender,
             topic,
             sent_timestamp: since_the_epoch.as_millis() as u64,
+            guard,
         };
 
         if transient {
@@ -1137,6 +1145,7 @@ struct InnerSendJob {
     pub status: tokio::sync::broadcast::Sender<(DeliveryHandle, SendResult)>,
     pub topic: &'static str,
     pub sent_timestamp: u64,
+    pub guard: Option<crate::APSSendGuard>,
 }
 
 impl InnerSendJob {
@@ -1215,7 +1224,12 @@ impl InnerSendJob {
 
             debug!("Sending value {value:?}");
 
-            self.conn.send_message(apns_topic, value, Some(msg_id)).await?
+            match self.conn.send_message_with_guard(apns_topic, value, Some(msg_id), self.guard.as_ref()).await {
+                // The guard rejected this batch, but earlier batches may have
+                // reached recipients. Preserve uncertainty in that case.
+                Err(PushError::SendGuardRejected) if batch > 0 => return Err(PushError::SendTimedOut),
+                result => result?,
+            }
         }
 
         if !message.no_response {
@@ -1268,6 +1282,12 @@ impl InnerSendJob {
             }
 
             if !remain_targets.is_empty() || !refresh_targets.is_empty() {
+                if self.guard.is_some() {
+                    for target in remain_targets.into_iter().chain(refresh_targets) {
+                        let _ = self.status.send((target, SendResult::TimedOut));
+                    }
+                    return Ok(());
+                }
                 // will bail early if refresh_targets is empty
                 let new_targets = self.identity.refresh_handles(self.topic, &handle, &refresh_targets).await?;
                 remain_targets.extend(new_targets);
