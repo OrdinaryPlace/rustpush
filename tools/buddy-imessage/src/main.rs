@@ -511,7 +511,7 @@ impl Worker {
                 (id, conversation, None, Some((question, options)), None),
             _ => return Err(WorkerError("invalid_operation")),
         };
-        if conversation.participants.len() > 2 && group_guard.is_none() {
+        if !feedback && conversation.participants.len() > 2 && group_guard.is_none() {
             return Err(WorkerError("group_guard_required"));
         }
         let group_binding = if let Some(guard) = group_guard {
