@@ -406,10 +406,13 @@ impl Worker {
         let state_directory = self.work_dir.clone();
         let failed = self.persistence_failed.clone();
         let output = self.output.clone();
+        let pending_for_state = inbound_images.clone();
         let state_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
                 interval.tick().await;
+                inbound_media::clean_if_present(&state_directory);
+                if let Ok(mut pending) = pending_for_state.lock() { pending.prune(); }
                 let state = state_connection.state.read().await.clone();
                 let result = (|| {
                     let bytes = plist_bytes(&state)?;
@@ -1368,6 +1371,33 @@ mod tests {
         assert_eq!(status["status"], "prepared");
         assert_eq!(status["message_guid"], prepared["message_guid"]);
         assert!(replies.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn verified_inline_image_event_retains_the_request_without_exposing_bytes() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let Command::PreparePoll { conversation, .. } = poll_command() else { panic!("Expected direct conversation") };
+        let owner = conversation.participants[0].clone();
+        let sender = conversation.participants[1].clone();
+        let mut normal = NormalMessage::new("Describe this image".into(), MessageType::IMessage);
+        normal.parts.0.insert(0, rustpush::IndexedMessagePart { part: MessagePart::Attachment(rustpush::Attachment {
+            a_type: rustpush::AttachmentType::Inline(STANDARD.decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNgAAAAAgABSK+kcQAAAABJRU5ErkJggg==").unwrap()),
+            part: 0, uti_type: "public.png".into(), mime: "image/png".into(), name: "synthetic.png".into(), iris: false,
+        }), idx: Some(0), ext: None });
+        let mut message = MessageInst::new(conversation.protocol(), &sender, Message::Message(normal));
+        message.id = "12345678-1234-4ABC-8ABC-123456789ABC".into();
+        message.sent_timestamp = epoch_ms();
+        let pending = Mutex::new(PendingImages::default());
+        let (output, mut events) = mpsc::channel(1);
+        emit_inbound(&output, &[owner], message, 0, &pending).await;
+        let event = events.recv().await.unwrap();
+        assert_eq!(event["kind"], "text");
+        assert_eq!(event["text"], "Describe this image");
+        assert_eq!(event["has_attachments"], true);
+        assert_eq!(event["inbound_image"]["status"], "available");
+        assert!(!event.to_string().contains("synthetic.png"));
+        assert!(!event.to_string().contains("iVBOR"));
     }
 
     #[test]

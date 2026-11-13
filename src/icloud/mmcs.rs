@@ -92,7 +92,7 @@ async fn send_mmcs_req(client: &Client, config: &MMCSConfig, url: &str, method: 
 fn confirm_for_resp(resp: &Response, url: &str, conf_token: &str, up_md5: Option<&[u8]>) -> mmcsp::confirm_response::Request {
     let edge_info = resp.headers().get("x-apple-edge-info").and_then(|value| value.to_str().ok()).map(str::to_owned);
     let status = resp.status();
-    let etag = resp.headers().get("ETag").clone().map(|i| i.to_str().unwrap().to_string());
+    let etag = resp.headers().get("ETag").and_then(|value| value.to_str().ok()).map(str::to_owned);
     mmcsp::confirm_response::Request {
         url: url.to_string(),
         status: status.as_u16() as u32,
@@ -644,7 +644,7 @@ pub async fn transfer_mmcs_container(client: &Client, req: &HttpRequest, body: O
         .header("user-agent", user_agent);
     let completing_at_edge = complete_req_at_edge(req);
     for header in &req.headers {
-        if (header.name == "Content-Length" && completing_at_edge) || header.name == "Host" {
+        if (header.name == "Content-Length" && completing_at_edge) || header.name.eq_ignore_ascii_case("Host") {
             continue // this isn't a rustpush hack, this is how you *think different*
         }
         upload_resp = upload_resp.header(header.name.clone(), header.value.clone());

@@ -47,8 +47,10 @@ impl PendingImage {
 pub struct PendingImages(VecDeque<PendingImage>);
 
 impl PendingImages {
+    pub fn prune(&mut self) { self.expire(Instant::now()); }
+
     fn expire(&mut self, now: Instant) {
-        while self.0.front().is_some_and(|item| now.duration_since(item.received) >= RETENTION) {
+        while self.0.front().is_some_and(|item| now.saturating_duration_since(item.received) >= RETENTION) {
             self.0.pop_front();
         }
     }
@@ -70,7 +72,7 @@ impl PendingImages {
     }
 
     pub fn take(&mut self, message_guid: &str, artifact_id: &str) -> Result<PendingImage> {
-        self.expire(Instant::now());
+        self.prune();
         let index = self.0.iter().position(|item| item.message_guid == message_guid && item.artifact_id == artifact_id)
             .ok_or(UNAVAILABLE)?;
         self.0.remove(index).ok_or(UNAVAILABLE)
