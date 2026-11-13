@@ -87,6 +87,8 @@ pub struct IDSRecvMessage {
     #[serde(skip)]
     pub verification_failed: bool,
     #[serde(skip)]
+    pub authenticated_madrid_payload: bool,
+    #[serde(skip)]
     pub topic: &'static str,
 }
 

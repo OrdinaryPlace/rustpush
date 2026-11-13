@@ -17,6 +17,8 @@ use crate::{aps::APSMessage, ids::user::{IDSError, SupportAlert}, util::Resource
 
 #[derive(Error, Debug)]
 pub enum PushError {
+    #[error("Send authorization changed before transport submission")]
+    SendGuardRejected,
     #[error("Cryptography error: {0}")]
     SSLError(#[from] ErrorStack),
     #[error("Plist parsing error: {0}")]

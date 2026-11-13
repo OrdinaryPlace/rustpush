@@ -234,6 +234,15 @@ pub struct Conversation {
     #[serde(default)] pub after_guid: Option<String>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupGuard {
+    pub sender_guid: String,
+    pub participants: Vec<String>,
+    pub generation: String,
+    pub revision: u64,
+}
+
 impl Conversation {
     pub fn validate(&self, own_handle: &str) -> Result<()> {
         if self.participants.is_empty() || self.participants.len() > 32 { return Err(WorkerError("invalid_conversation")); }
@@ -264,6 +273,7 @@ pub enum Command {
     Status { id: String, operation_id: String },
     FetchInboundImage { id: String, message_guid: String, artifact_id: String },
     SendText { id: String, conversation: Conversation, text: String },
+    SendGroupText { id: String, conversation: Conversation, text: String, group_guard: GroupGuard },
     SendFeedback { id: String, conversation: Conversation, text: String },
     SendPoll { id: String, conversation: Conversation, question: String, options: Vec<String> },
     PrepareText { id: String, conversation: Conversation, text: String },
@@ -279,7 +289,7 @@ impl Command {
             Self::Validate { id } | Self::Connect { id } | Self::Disconnect { id }
             | Self::Typing { id, .. }
             | Self::Status { id, .. } | Self::FetchInboundImage { id, .. } | Self::SendText { id, .. } | Self::SendPoll { id, .. }
-            | Self::SendFeedback { id, .. }
+            | Self::SendFeedback { id, .. } | Self::SendGroupText { id, .. }
             | Self::PrepareText { id, .. } | Self::PreparePoll { id, .. } | Self::PrepareImage { id, .. }
             | Self::PrepareMedia { id, .. } | Self::Dispatch { id, .. } => id,
         }

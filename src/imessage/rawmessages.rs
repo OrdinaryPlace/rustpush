@@ -419,7 +419,8 @@ struct RawIMessage {
     after_guid: Option<String>, // uuid
     #[serde(rename = "gid")]
     sender_guid: Option<String>,
-    pv: u64,
+    #[serde(default)]
+    pub pv: Option<u64>,
     gv: String,
     v: String,
     #[serde(rename = "iid")]

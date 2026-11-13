@@ -96,6 +96,8 @@ impl IDSRecvMessage {
             target: token.clone().map(|token| vec![MessageTarget::Token(token)]),
             send_delivered: send_delivered.unwrap_or(false),
             verification_failed: self.verification_failed,
+            authenticated_madrid_payload: self.authenticated_madrid_payload,
+            participant_version: None,
             certified_context: self.certified_context(),
         })
     }
@@ -200,6 +202,8 @@ impl IMClient {
                 target: None,
                 send_delivered: false,
                 verification_failed: false,
+                authenticated_madrid_payload: false,
+                participant_version: None,
                 certified_context: None,
             }))
         }
@@ -314,14 +318,14 @@ impl IMClient {
     }
 
     pub async fn send(&self, message: &mut MessageInst) -> Result<SendJob, PushError> {
-        self.send_internal(message, false).await
+        self.send_internal(message, false, None).await
     }
 
     /// Await transient typing directly so cancelling a bounded worker request
     /// cannot detach a send job that later shows a stale typing indicator.
     pub async fn send_typing(&self, message: &mut MessageInst) -> Result<(), PushError> {
         if !matches!(&message.message, Message::Typing(_, None)) { return Err(PushError::BadMsg); }
-        self.send_internal(message, true).await?;
+        self.send_internal(message, true, None).await?;
         Ok(())
     }
 
@@ -331,10 +335,20 @@ impl IMClient {
         if !matches!(&message.message, Message::Message(normal) if normal.plain_feedback_text().is_some()) {
             return Err(PushError::BadMsg);
         }
-        self.send_internal(message, true).await
+        self.send_internal(message, true, None).await
     }
 
-    async fn send_internal(&self, message: &mut MessageInst, transient: bool) -> Result<SendJob, PushError> {
+    /// Submit ordinary group text with a check at each actual APS payload write.
+    pub async fn send_guarded_group_text(&self, message: &mut MessageInst, guard: crate::APSSendGuard) -> Result<SendJob, PushError> {
+        if !matches!(&message.message, Message::Message(normal) if normal.plain_feedback_text().is_some())
+            || !message.conversation.as_ref().is_some_and(ConversationData::is_group)
+            || message.is_queued() || message.target.is_some() {
+            return Err(PushError::BadMsg);
+        }
+        self.send_internal(message, true, Some(guard)).await
+    }
+
+    async fn send_internal(&self, message: &mut MessageInst, transient: bool, guard: Option<crate::APSSendGuard>) -> Result<SendJob, PushError> {
         let handles = self.identity.get_handles().await;
 
         let topic = if message.message.is_sms() { "com.apple.private.alloy.sms" } else { "com.apple.madrid" };
@@ -364,6 +378,10 @@ impl IMClient {
         }
         
         let my_handles = self.identity.get_handles().await;
+        if guard.is_some() && targets.iter().filter(|target| !my_handles.contains(target))
+            .any(|target| !message_targets.iter().any(|entry| &entry.participant == target)) {
+            return Err(PushError::NoValidTargets);
+        }
 
         if message.is_queued() {
             let mut targets = message_targets.clone();
@@ -380,7 +398,9 @@ impl IMClient {
 
         let ids_message = message.get_ids(&my_handles, &self.conn, true).await?;
 
-        if transient {
+        if let Some(guard) = guard {
+            self.identity.send_guarded_message(topic, ids_message, message_targets, guard).await
+        } else if transient {
             if matches!(&message.message, Message::Typing(_, None)) {
                 self.identity.send_transient_message(topic, ids_message, message_targets).await
             } else {

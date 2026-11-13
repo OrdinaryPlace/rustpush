@@ -2225,6 +2225,10 @@ pub struct MessageInst {
     pub send_delivered: bool,
     pub verification_failed: bool,
     pub certified_context: Option<CertifiedContext>,
+    #[serde(skip)]
+    pub authenticated_madrid_payload: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participant_version: Option<u64>,
 }
 
 impl MessageInst {
@@ -2240,6 +2244,8 @@ impl MessageInst {
             target: None,
             verification_failed: false,
             certified_context: None,
+            authenticated_madrid_payload: false,
+            participant_version: None,
         }
     }
 
@@ -2319,6 +2325,8 @@ impl MessageInst {
                     target: None,
                     verification_failed: false,
                     certified_context: None,
+                    authenticated_madrid_payload: false,
+                    participant_version: None,
                 };
                 return message.get_ids(my_handles, apns, schedule).await;
             }
@@ -2573,7 +2581,7 @@ impl MessageInst {
                             participants: conversation.participants.clone(),
                             after_guid: conversation.after_guid.clone(),
                             sender_guid: conversation.sender_guid.clone(),
-                            pv: 0,
+                            pv: Some(self.participant_version.unwrap_or_default()),
                             gv: "8".to_string(),
                             v: "1".to_string(),
                             effect: normal.effect.clone(),
@@ -3196,7 +3204,7 @@ impl MessageInst {
                 }
             }
             debug!("e");
-            return wrapper.to_message(Some(ConversationData {
+            let mut message = wrapper.to_message(Some(ConversationData {
                 participants: loaded.participants.clone(),
                 cv_name: loaded.cv_name.clone(),
                 sender_guid: loaded.sender_guid.clone(),
@@ -3217,7 +3225,9 @@ impl MessageInst {
                     ScheduleMode { ms: system_time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64, schedule: true }
                 }),
                 embedded_profile: shared_profile,
-            }))
+            }))?;
+            message.participant_version = loaded.pv;
+            return Ok(message)
         }
         Err(PushError::BadMsg)
     }

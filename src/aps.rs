@@ -16,7 +16,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector, client::TlsStream, rustls::pki_typ
 use async_recursion::async_recursion;
 use tokio_util::task::AbortOnDropHandle;
 
-use crate::{OSConfig, PushError, activation::activate, auth::{NonceType, do_ids_signature, generate_nonce}, imessage::messages, statuskit::statuskitp::{Channel, SubscribeToChannel, SubscribedTopic}, util::{APNS_BAG, BinaryReadExt, DebugMutex, DebugRwLock, KeyPair, KeyPairNew, Resource, ResourceManager, base64_encode, bin_deserialize, bin_deserialize_opt, bin_serialize, bin_serialize_opt, decode_hex, encode_hex, get_bag, plist_to_bin}};
+use crate::{OSConfig, PushError, ResourceState, activation::activate, auth::{NonceType, do_ids_signature, generate_nonce}, imessage::messages, statuskit::statuskitp::{Channel, SubscribeToChannel, SubscribedTopic}, util::{APNS_BAG, BinaryReadExt, DebugMutex, DebugRwLock, KeyPair, KeyPairNew, Resource, ResourceManager, base64_encode, bin_deserialize, bin_deserialize_opt, bin_serialize, bin_serialize_opt, decode_hex, encode_hex, get_bag, plist_to_bin}};
 
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1194,12 +1194,22 @@ impl Drop for APSInterestToken {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct APSIngressSnapshot {
+    pub generation: u64,
+    pub sequence: u64,
+    pub active: bool,
+}
+
+pub type APSSendGuard = Arc<dyn Fn(APSIngressSnapshot) -> bool + Send + Sync>;
+
 pub struct APSConnectionResource {
     pub os_config: Arc<dyn OSConfig>,
     pub state: DebugRwLock<APSState>,
     socket: DebugMutex<Option<(WriteHalf<TlsStream<TcpStream>>, Option<APSPackedEncoder>)>>,
     messages: DebugRwLock<Option<broadcast::Sender<APSMessage>>>,
     pub messages_cont: broadcast::Sender<APSMessage>,
+    ingress: tokio::sync::Mutex<APSIngressSnapshot>,
     manager: DebugMutex<Option<Weak<ResourceManager<Self>>>>,
     topics: mpsc::Sender<(Vec<String>, bool)>,
     current_topics: DebugMutex<Vec<String>>,
@@ -1260,6 +1270,12 @@ async fn open_socket() -> Result<(TlsStream<TcpStream>, Option<APSPackedEncoder>
 impl Resource for APSConnectionResource {
     async fn generate(self: &Arc<Self>) -> Result<AbortOnDropHandle<()>, PushError> {
         info!("Generating APS");
+        let generation = {
+            let mut ingress = self.ingress.lock().await;
+            ingress.active = false;
+            ingress.generation = ingress.generation.checked_add(1).ok_or(PushError::ResourceClosed)?;
+            ingress.generation
+        };
         let (socket, encoder, mut decoder) = match open_socket().await {
             Ok(e) => e,
             Err(err) => {
@@ -1282,12 +1298,24 @@ impl Resource for APSConnectionResource {
             loop {
                 match APSMessage::read_from_stream(&mut read, &mut decoder).await {
                     Ok(Some(msg)) => {
-                        let _ = maintenance_self.messages.read().await.as_ref().unwrap().send(msg.clone()); // if it fails, someone might care later
-                        let _ = maintenance_self.messages_cont.send(msg);
+                        let mut ingress = maintenance_self.ingress.lock().await;
+                        if ingress.generation != generation { return; }
+                        if matches!(&msg, APSMessage::Notification { .. }) {
+                            let Some(next) = ingress.sequence.checked_add(1) else {
+                                ingress.active = false;
+                                return;
+                            };
+                            ingress.sequence = next;
+                        }
+                        let _ = maintenance_self.messages_cont.send(msg.clone());
+                        drop(ingress);
+                        let _ = maintenance_self.messages.read().await.as_ref().unwrap().send(msg);
                     },
                     Ok(None) => {},
                     Err(err) => {
                         error!("Failed to read message from APS with error {}", err);
+                        let mut ingress = maintenance_self.ingress.lock().await;
+                        if ingress.generation == generation { ingress.active = false; }
                         return
                     }
                 };
@@ -1299,6 +1327,8 @@ impl Resource for APSConnectionResource {
             maintenence_handle.abort();
             return Err(err);
         }
+        let mut ingress = self.ingress.lock().await;
+        if ingress.generation == generation && !maintenence_handle.is_finished() { ingress.active = true; }
 
         Ok(maintenence_handle)
     }
@@ -1317,6 +1347,7 @@ impl APSConnectionResource {
             socket: DebugMutex::new(None),
             messages: DebugRwLock::new(None),
             messages_cont,
+            ingress: tokio::sync::Mutex::new(APSIngressSnapshot::default()),
             manager: DebugMutex::new(None),
             topics: topics_sender,
             sub_counter: AtomicU32::new(1),
@@ -1471,16 +1502,24 @@ impl APSConnectionResource {
     }
 
     pub async fn send_message(&self, topic: &str, data: impl Serialize, id: Option<i32>) -> Result<(), PushError> {
+        self.send_message_with_guard(topic, data, id, None).await
+    }
+
+    pub(crate) async fn send_message_with_guard(&self, topic: &str, data: impl Serialize, id: Option<i32>,
+        guard: Option<&APSSendGuard>) -> Result<(), PushError> {
         let my_id = id.unwrap_or_else(|| new_aps_id());
-        self.send(APSMessage::Notification {
+        let guarded_responses = if guard.is_some() { Some(self.subscribe().await) } else { None };
+        self.send_with_guard(APSMessage::Notification {
             id: my_id,
             topic: sha1(topic.as_bytes()),
             token: Some(self.get_token().await),
             payload: plist::to_value(&data)?,
             channel: None,
-        }).await?;
-        let status = self.wait_for_timeout(self.subscribe().await, |msg| {
-            let APSMessage::Ack { token: _token, for_id: _, status } = msg else { return None };
+        }, guard).await?;
+        let responses = match guarded_responses { Some(responses) => responses, None => self.subscribe().await };
+        let status = self.wait_for_timeout(responses, |msg| {
+            let APSMessage::Ack { for_id, status, .. } = msg else { return None };
+            if guard.is_some() && for_id != my_id { return None; }
             Some(status)
         }).await?;
         if status != 0 {
@@ -1492,6 +1531,16 @@ impl APSConnectionResource {
 
     pub async fn subscribe(&self) -> Receiver<APSMessage> {
         self.messages.read().await.as_ref().map(|msgs| msgs.subscribe()).unwrap_or_else(|| Sender::new(1).subscribe())
+    }
+
+    /// Capture the ingress cursor and its subscription under the same lock.
+    pub async fn subscribe_ingress(&self) -> (APSIngressSnapshot, Receiver<APSMessage>) {
+        let ingress = self.ingress.lock().await;
+        (*ingress, self.messages_cont.subscribe())
+    }
+
+    pub async fn ingress_snapshot(&self) -> APSIngressSnapshot {
+        *self.ingress.lock().await
     }
 
     pub async fn wait_for_timeout<F, T>(&self, recv: impl BorrowMut<Receiver<APSMessage>>, f: F) -> Result<T, PushError>
@@ -1527,14 +1576,29 @@ impl APSConnectionResource {
     }
 
     pub async fn send(&self, message: APSMessage) -> Result<(), PushError> {
+        self.send_with_guard(message, None).await
+    }
+
+    async fn send_with_guard(&self, message: APSMessage, guard: Option<&APSSendGuard>) -> Result<(), PushError> {
         info!("Attempting to send");
         // during init can be none
-        if let Some(manager) = self.get_manager().await {
+        let manager = self.get_manager().await;
+        if let Some(manager) = &manager {
             manager.ensure_not_failed()?;
         }
 
         let mut socket_guard = self.socket.lock().await;
         let socket = socket_guard.as_mut().ok_or(PushError::NotConnected)?;
+        // A guarded write and notification enqueue share the ingress lock.
+        // Check after waiting for the socket and keep the check bound to write.
+        let ingress_guard = if let Some(guard) = guard {
+            let ingress = self.ingress.lock().await;
+            if !ingress.active || !manager.as_ref().is_some_and(|manager|
+                matches!(&*manager.resource_state.borrow(), ResourceState::Generated)) || !guard(*ingress) {
+                return Err(PushError::SendGuardRejected);
+            }
+            Some(ingress)
+        } else { None };
         let write_result = if let Some(encoder) = &mut socket.1 {
             debug!("Sending {:?}", encode_hex(&plist_to_bin(&message).unwrap()));
 
@@ -1552,6 +1616,7 @@ impl APSConnectionResource {
             let text = raw.to_bytes()?;
             socket.0.write_all(&text).await
         };
+        drop(ingress_guard);
         drop(socket_guard);
         
         if let Err(e) = write_result {

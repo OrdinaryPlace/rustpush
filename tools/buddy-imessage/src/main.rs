@@ -12,7 +12,7 @@ use std::future::Future;
 use buddy_imessage::*;
 use keystore::{init_keystore, software::{NoEncryptor, SoftwareKeystore, SoftwareKeystoreState}};
 use rustpush::{APSConnection, APSConnectionResource, APSState, IDSNGMIdentity, IDSUser,
-    IMClient, MADRID_SERVICE, Message, MessageInst, MessagePart, MessageType, NormalMessage, OSConfig, SendJob, SendResult};
+    IMClient, MADRID_SERVICE, Message, MessageInst, MessagePart, MessageType, NormalMessage, OSConfig, PushError, SendJob, SendResult};
 use rustpush::polls::{NativePollPayload, PollPayload};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -22,6 +22,8 @@ use tokio::task::JoinHandle;
 
 mod inbound_media;
 use inbound_media::PendingImages;
+mod group_roster;
+use group_roster::{GroupRoster, transport_guard};
 
 #[derive(Clone, Serialize, Deserialize)]
 struct PollMetadata { session_id: String, option_ids: Vec<String> }
@@ -63,6 +65,8 @@ struct Operation {
     attachment: Option<media::MediaBinding>,
     #[serde(default, rename = "image_upload")]
     attachment_upload: Option<MediaUpload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group_guard: Option<GroupGuard>,
 }
 
 struct Connected {
@@ -72,6 +76,7 @@ struct Connected {
     session: Arc<Mutex<SessionExport>>,
     tasks: Vec<JoinHandle<()>>,
     inbound_images: Arc<Mutex<PendingImages>>,
+    group_roster: Arc<Mutex<GroupRoster>>,
 }
 
 impl Drop for Connected {
@@ -96,7 +101,7 @@ const FEEDBACK_SEND_BUDGET: Duration = Duration::from_secs(2);
 const MEDIA_UPLOAD_BUDGET: Duration = Duration::from_secs(60);
 
 fn ready_event() -> Value {
-    json!({"event":"ready","connected":false,"network_contacted":false,"capabilities":{"typing":true,"feedback":true,"images":true,"media":true,"inbound_images":true}})
+    json!({"event":"ready","connected":false,"network_contacted":false,"capabilities":{"typing":true,"feedback":true,"images":true,"media":true,"inbound_images":true,"guarded_group_text":true}})
 }
 
 async fn typing_status<F, E>(send: F, budget: Duration) -> &'static str
@@ -361,7 +366,8 @@ impl Worker {
             save_bundle(&current, &self.work_dir)
         })();
         if initial_save.is_err() { connection.close(); return Err(WorkerError("state_persist_failed")); }
-        let mut receive = connection.messages_cont.subscribe();
+        let (initial_ingress, mut receive) = connection.subscribe_ingress().await;
+        let group_roster = Arc::new(Mutex::new(GroupRoster::new(initial_ingress)));
         let session_for_users = session.clone();
         let directory_for_users = self.work_dir.clone();
         let failed = self.persistence_failed.clone();
@@ -384,20 +390,42 @@ impl Worker {
         let connected_at_ms = epoch_ms();
         let inbound_images = Arc::new(Mutex::new(PendingImages::default()));
         let incoming = inbound_images.clone();
+        let actor_for_receive = actor.clone();
+        let group_incoming = group_roster.clone();
         let receive_task = tokio::spawn(async move {
             loop {
                 match receive.recv().await {
-                    Ok(message) => match recv_client.handle(message).await {
-                        Ok(Some(message)) => emit_inbound(&output, &actual_handles, message, connected_at_ms, &incoming).await,
-                        Ok(None) => {},
-                        Err(_) => emit(&output, json!({"event":"transport_error","code":"inbound_decode_failed"})).await,
-                    },
+                    Ok(message) => {
+                        let notification = matches!(&message, rustpush::APSMessage::Notification { .. });
+                        let result = recv_client.handle(message).await;
+                        let ingress = recv_client.conn.ingress_snapshot().await;
+                        let received_at_ms = epoch_ms();
+                        let membership = group_incoming.lock().ok().and_then(|mut roster| {
+                            if notification { roster.processed(ingress); }
+                            match &result {
+                                Ok(Some(message)) => roster.observe(message, &actor_for_receive, &actual_handles,
+                                    connected_at_ms, received_at_ms),
+                                Ok(None) => None,
+                                Err(_) => { roster.invalidate_all(); None }
+                            }
+                        });
+                        match result {
+                            Ok(Some(message)) => emit_inbound_event(&output, &actual_handles, message,
+                                connected_at_ms, received_at_ms, &incoming, membership).await,
+                            Ok(None) => {},
+                            Err(_) => emit(&output, json!({"event":"transport_error","code":"inbound_decode_failed"})).await,
+                        }
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        if let Ok(mut roster) = group_incoming.lock() { roster.invalidate_all(); }
                         emit(&output, json!({"event":"transport_error","code":"receive_overflow_restart_required"})).await;
                         recv_client.conn.close();
                         break;
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        if let Ok(mut roster) = group_incoming.lock() { roster.invalidate_all(); }
+                        break;
+                    }
                 }
             }
         });
@@ -407,6 +435,7 @@ impl Worker {
         let failed = self.persistence_failed.clone();
         let output = self.output.clone();
         let pending_for_state = inbound_images.clone();
+        let groups_for_state = group_roster.clone();
         let state_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
@@ -421,13 +450,15 @@ impl Worker {
                     save_bundle(&session, &state_directory)
                 })();
                 if result.is_err() || failed.load(Ordering::SeqCst) {
+                    if let Ok(mut roster) = groups_for_state.lock() { roster.invalidate_all(); }
                     emit(&output, json!({"event":"transport_error","code":"state_persist_failed_restart_required"})).await;
                     state_connection.close();
                     break;
                 }
             }
         });
-        self.connected = Some(Connected { connection, client, actor, session, tasks: vec![receive_task, state_task], inbound_images });
+        self.connected = Some(Connected { connection, client, actor, session, tasks: vec![receive_task, state_task],
+            inbound_images, group_roster });
         Ok(())
     }
 
@@ -463,21 +494,32 @@ impl Worker {
             message.prepare_send(&[bundle.preferred_handle]);
             let operation = Operation { version: 1, id: id.clone(), fingerprint: digest, message,
                 poll: None, poll_payload: None, status: "prepared".into(), send_diagnostics: None, feedback: false,
-                attachment: Some(attachment), attachment_upload: None };
+                attachment: Some(attachment), attachment_upload: None, group_guard: None };
             save_operation(&self.work_dir, &operation)?;
             self.operations.lock().map_err(|_| WorkerError("operation_state_failed"))?.insert(id.clone(), operation.clone());
             return Ok(operation);
         }
         let bundle = load_bundle(&self.export_path, &self.work_dir)?;
         let feedback = matches!(command, Command::SendFeedback { .. });
-        let (id, conversation, text, poll) = match command {
+        let (id, conversation, text, poll, group_guard) = match command {
             Command::SendText { id, conversation, text } | Command::PrepareText { id, conversation, text }
             | Command::SendFeedback { id, conversation, text } =>
-                (id, conversation, Some(text), None),
+                (id, conversation, Some(text), None, None),
+            Command::SendGroupText { id, conversation, text, group_guard } =>
+                (id, conversation, Some(text), None, Some(group_guard)),
             Command::SendPoll { id, conversation, question, options } | Command::PreparePoll { id, conversation, question, options } =>
-                (id, conversation, None, Some((question, options))),
+                (id, conversation, None, Some((question, options)), None),
             _ => return Err(WorkerError("invalid_operation")),
         };
+        if !feedback && conversation.participants.len() > 2 && group_guard.is_none() {
+            return Err(WorkerError("group_guard_required"));
+        }
+        let group_binding = if let Some(guard) = group_guard {
+            let connected = self.connected.as_ref().ok_or(WorkerError("not_connected"))?;
+            Some(connected.group_roster.lock().map_err(|_| WorkerError("group_membership_changed"))?
+                .bind(conversation, guard, epoch_ms())?)
+        } else { None };
+        let conversation = group_binding.as_ref().map_or(conversation, |binding| &binding.conversation);
         conversation.validate(&bundle.preferred_handle)?;
         if feedback { validate_typing_conversation(conversation, &bundle.preferred_handle, &[bundle.preferred_handle.clone()])?; }
         let digest = fingerprint(command)?;
@@ -502,13 +544,14 @@ impl Worker {
             (NormalMessage::new(text.clone(), MessageType::IMessage), None, None)
         };
         let mut message = MessageInst::new(conversation.protocol(), &bundle.preferred_handle, Message::Message(normal));
+        message.participant_version = group_binding.map(|binding| binding.participant_version);
         // Persist stable group/DM and MessageInst GUIDs before crossing the
         // network boundary. Subsequent prepare_send calls keep these GUIDs,
         // but refresh the wire timestamp.
         message.prepare_send(&[bundle.preferred_handle]);
         let operation = Operation { version: 1, id: id.clone(), fingerprint: digest,
             message, poll: metadata, poll_payload, status: "prepared".into(), send_diagnostics: None, feedback,
-            attachment: None, attachment_upload: None };
+            attachment: None, attachment_upload: None, group_guard: group_guard.cloned() };
         save_operation(&self.work_dir, &operation)?;
         self.operations.lock().map_err(|_| WorkerError("operation_state_failed"))?.insert(id.clone(), operation.clone());
         Ok(operation)
@@ -533,6 +576,19 @@ impl Worker {
         Conversation { participants: conversation.participants.clone(), sender_guid: conversation.sender_guid.clone(),
             cv_name: conversation.cv_name.clone(), after_guid: conversation.after_guid.clone() }.validate(&connected.actor)?;
         let expected_participants = conversation.participants.clone();
+        let group_transport_guard = if let Some(guard) = &operation.group_guard {
+            if !conversation.is_group() || operation.feedback || operation.poll.is_some()
+                || operation.poll_payload.is_some() || operation.attachment.is_some()
+                || !matches!(&operation.message.message, Message::Message(normal) if normal.plain_feedback_text().is_some())
+                || !group_roster::operation_matches(guard, conversation) {
+                return Err(WorkerError("invalid_group_guard"));
+            }
+            let participant_version = operation.message.participant_version.ok_or(WorkerError("invalid_group_guard"))?;
+            Some(transport_guard(connected.group_roster.clone(), guard.clone(), participant_version, epoch_ms))
+        } else {
+            if conversation.is_group() { return Err(WorkerError("group_guard_required")); }
+            None
+        };
         let attachment_bytes = if let Some(attachment) = &operation.attachment {
             let binding = Conversation { participants: conversation.participants.clone(), sender_guid: conversation.sender_guid.clone(),
                 cv_name: conversation.cv_name.clone(), after_guid: conversation.after_guid.clone() };
@@ -560,8 +616,20 @@ impl Worker {
             if !store_media_upload(&self.work_dir, &mut operation, MEDIA_UPLOAD_BUDGET, upload).await? { return Ok(operation); }
             if self.persistence_failed.load(Ordering::SeqCst) { return Err(WorkerError("state_persist_failed")); }
         }
-        let result = tokio::time::timeout(Duration::from_secs(60), connected.client.send(&mut operation.message)).await;
+        let result = if let Some(guard) = group_transport_guard {
+            tokio::time::timeout(Duration::from_secs(60),
+                connected.client.send_guarded_group_text(&mut operation.message, guard)).await
+        } else {
+            tokio::time::timeout(Duration::from_secs(60), connected.client.send(&mut operation.message)).await
+        };
         let diagnostics = match result {
+            Ok(Err(PushError::SendGuardRejected)) => {
+                operation.status = "suppressed".into();
+                save_operation(&self.work_dir, &operation)?;
+                self.operations.lock().map_err(|_| WorkerError("operation_state_failed"))?
+                    .insert(operation.id.clone(), operation);
+                return Err(WorkerError("group_membership_changed"));
+            }
             Ok(Ok(job)) => observe_send_job(job, &own_handles, &expected_participants, Duration::from_secs(150)).await,
             Ok(Err(_)) => SendDiagnostics { job_state: SendJobState::ClientFailed, ..SendDiagnostics::default() },
             Err(_) => SendDiagnostics { job_state: SendJobState::ClientTimedOut, ..SendDiagnostics::default() },
@@ -664,7 +732,7 @@ impl Worker {
                 let operation = self.dispatch_feedback(operation, deadline).await?;
                 emit(&self.output, report_operation(&operation, &id)).await;
             }
-            Command::SendText { .. } | Command::SendPoll { .. } => {
+            Command::SendText { .. } | Command::SendPoll { .. } | Command::SendGroupText { .. } => {
                 if self.connected.is_none() { return Err(WorkerError("not_connected")); }
                 let operation = self.prepare(&command)?;
                 let operation = self.dispatch(&operation.id).await?;
@@ -788,6 +856,10 @@ fn inbound_event(handles: &[String], message: &MessageInst, connected_at_ms: u64
             Message::Delivered => { event["kind"] = json!("delivery_receipt"); }
             Message::Read => { event["kind"] = json!("read_receipt"); }
             Message::React(_) => { event["kind"] = json!("reaction"); }
+            Message::ChangeParticipants(change) => {
+                event["kind"] = json!("unsupported");
+                event["group_change"] = json!({"participants":change.new_participants,"version":change.group_version});
+            }
             Message::Error(error) => {
                 let reason = error_reason(&error.status_str);
                 event["kind"] = json!("error");
@@ -807,10 +879,11 @@ fn inbound_event(handles: &[String], message: &MessageInst, connected_at_ms: u64
     event
 }
 
-async fn emit_inbound(output: &mpsc::Sender<Value>, handles: &[String], message: MessageInst,
-    connected_at_ms: u64, pending: &Mutex<PendingImages>) {
-    let received_at_ms = epoch_ms();
+async fn emit_inbound_event(output: &mpsc::Sender<Value>, handles: &[String], message: MessageInst,
+    connected_at_ms: u64, received_at_ms: u64, pending: &Mutex<PendingImages>,
+    membership: Option<group_roster::Membership>) {
     let mut event = inbound_event(handles, &message, connected_at_ms, received_at_ms);
+    if let Some(membership) = membership { event["group_membership"] = json!(membership); }
     // The application owns enrollment and replay decisions. Keep only recent
     // verified direct-message descriptors and never fetch on intake.
     let recent = message.sent_timestamp > 0 && received_at_ms.abs_diff(message.sent_timestamp) <= 600_000;
@@ -978,7 +1051,7 @@ mod tests {
     #[test]
     fn ready_advertises_typing_without_connection_or_private_identifiers() {
         assert_eq!(ready_event(), json!({"event":"ready","connected":false,"network_contacted":false,
-            "capabilities":{"typing":true,"feedback":true,"images":true,"media":true,"inbound_images":true}}));
+            "capabilities":{"typing":true,"feedback":true,"images":true,"media":true,"inbound_images":true,"guarded_group_text":true}}));
     }
 
     fn image_command(directory: &Path) -> Command {
@@ -1390,7 +1463,7 @@ mod tests {
         message.sent_timestamp = epoch_ms();
         let pending = Mutex::new(PendingImages::default());
         let (output, mut events) = mpsc::channel(1);
-        emit_inbound(&output, &[owner], message, 0, &pending).await;
+        emit_inbound_event(&output, &[owner], message, 0, epoch_ms(), &pending, None).await;
         let event = events.recv().await.unwrap();
         assert_eq!(event["kind"], "text");
         assert_eq!(event["text"], "Describe this image");
