@@ -62,6 +62,24 @@ fn bounded_container_request(req: &HttpRequest) -> bool {
         && req.path.bytes().all(|byte| byte.is_ascii_graphic() && !b"\\#".contains(&byte))
 }
 
+fn bounded_container_size(container: &ProtoContainer, size: usize) -> Result<usize, PushError> {
+    if !container.request.as_ref().is_some_and(bounded_container_request)
+        || container.chunks.is_empty() || container.chunks.len() > 128 {
+        return Err(invalid_attachment());
+    }
+    let mut end = 0usize;
+    for chunk in &container.chunks {
+        let meta = chunk.meta.as_ref().ok_or_else(invalid_attachment)?;
+        let offset = usize::try_from(meta.offset).map_err(|_| invalid_attachment())?;
+        let chunk_size = usize::try_from(meta.size).map_err(|_| invalid_attachment())?;
+        if chunk_size == 0 || offset < end || meta.checksum.len() != 21 || meta.encryption_key.is_some() {
+            return Err(invalid_attachment());
+        }
+        end = offset.checked_add(chunk_size).filter(|end| *end <= size).ok_or_else(invalid_attachment)?;
+    }
+    Ok(end)
+}
+
 fn invalid_attachment() -> PushError { PushError::MMCSGetFailed(None) }
 
 async fn send_mmcs_req(client: &Client, config: &MMCSConfig, url: &str, method: &str, auth: &str, dsid: &str, body: &[u8]) -> Result<Response, PushError> {
@@ -1089,20 +1107,7 @@ pub(crate) async fn get_mmcs_bounded(config: &MMCSConfig, authorized: Authorized
     let mut sources = Vec::new();
     let mut transfer_size = 0usize;
     for container in &response.containers {
-        if !container.request.as_ref().is_some_and(bounded_container_request)
-            || container.chunks.is_empty() || container.chunks.len() > 128 {
-            return Err(invalid_attachment());
-        }
-        let mut end = 0usize;
-        for chunk in &container.chunks {
-            let meta = chunk.meta.as_ref().ok_or_else(invalid_attachment)?;
-            let offset = meta.offset as usize;
-            let chunk_size = meta.size as usize;
-            if chunk_size == 0 || offset < end || meta.checksum.len() != 21 || meta.encryption_key.is_some() {
-                return Err(invalid_attachment());
-            }
-            end = offset.checked_add(chunk_size).filter(|end| *end <= size).ok_or_else(invalid_attachment)?;
-        }
+        let end = bounded_container_size(container, size)?;
         transfer_size = transfer_size.checked_add(end).filter(|total| *total <= size).ok_or_else(invalid_attachment)?;
         let mut source = MMCSGetContainer::new(container.clone(), config.user_agent.clone());
         source.byte_limit = Some(end);
@@ -1277,4 +1282,49 @@ pub async fn get_mmcs(config: &MMCSConfig, authorized: AuthorizedOperation, file
     }
 
     Ok(())
+}
+
+
+#[cfg(test)]
+mod bounded_attachment_tests {
+    use super::*;
+    use mmcsp::container::{ChunkMeta, ChunkWrapper};
+
+    fn container() -> ProtoContainer {
+        ProtoContainer {
+            request: Some(HttpRequest { domain: "content.example.icloud.com".into(),
+                port: 443, method: "GET".into(), scheme: "https".into(), path: "/sample".into(),
+                ..Default::default() }),
+            chunks: vec![ChunkWrapper { meta: Some(ChunkMeta { checksum: vec![1; 21],
+                size: 12, offset: 0, encryption_key: None }), encryption: None }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn validates_apple_https_container_and_exact_byte_range_before_network() {
+        let valid = container();
+        assert_eq!(bounded_container_size(&valid, 12).unwrap(), 12);
+        assert!(bounded_container_size(&valid, 11).is_err());
+        for domain in ["127.0.0.1", "usercontent.icloud.com.example.test", "abc@content.icloud.com",
+            "content.icloud.com/private", "content.icloud.com:80"] {
+            let mut invalid = valid.clone();
+            invalid.request.as_mut().unwrap().domain = domain.into();
+            assert!(bounded_container_size(&invalid, 12).is_err());
+        }
+        for port in [80, 444] {
+            let mut invalid = valid.clone();
+            invalid.request.as_mut().unwrap().port = port;
+            assert!(bounded_container_size(&invalid, 12).is_err());
+        }
+        let mut invalid = valid.clone();
+        invalid.request.as_mut().unwrap().method = "PUT".into();
+        assert!(bounded_container_size(&invalid, 12).is_err());
+        let mut invalid = valid.clone();
+        invalid.chunks[0].meta.as_mut().unwrap().offset = u64::MAX;
+        assert!(bounded_container_size(&invalid, 12).is_err());
+        let mut invalid = valid;
+        invalid.chunks[0].meta.as_mut().unwrap().checksum.clear();
+        assert!(bounded_container_size(&invalid, 12).is_err());
+    }
 }

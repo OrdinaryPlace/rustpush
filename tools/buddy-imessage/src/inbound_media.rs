@@ -292,6 +292,24 @@ mod tests {
     }
 
     #[test]
+    fn remote_descriptor_rejects_non_apple_urls_and_mismatched_object_without_network() {
+        let file = MMCSFile { signature: vec![1; 21], key: vec![2; 32], object: "12345".into(),
+            url: "https://content.example.icloud.com/12345".into(), size: 42 };
+        assert!(file.is_bounded_attachment(42));
+        assert!(!file.is_bounded_attachment(41));
+        for url in [
+            "https://content.example.icloud.com/9999",
+            "http://content.example.icloud.com/12345",
+            "https://content.example.icloud.com:444/12345",
+            "https://content.example.icloud.com.example.test/12345",
+            "https://content.example.icloud.com/12345?query",
+            "https://user@content.example.icloud.com/12345",
+        ] {
+            assert!(!MMCSFile { url: url.into(), ..file.clone() }.is_bounded_attachment(42));
+        }
+    }
+
+    #[test]
     fn only_validated_bytes_are_written_to_private_spool() {
         let directory = std::env::temp_dir().join(format!("receive-fixture-{}", Uuid::new_v4()));
         fs::DirBuilder::new().mode(0o700).create(&directory).unwrap();

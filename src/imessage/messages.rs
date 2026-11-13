@@ -1649,8 +1649,10 @@ impl MMCSFile {
             signature: self.signature.to_vec().into()
         };
 
-        info!("mmcs obj {} sig {}", self.object, encode_hex(&self.signature));
-        
+        if !bounded {
+            info!("mmcs obj {} sig {}", self.object, encode_hex(&self.signature));
+        }
+
         let recv = apns.subscribe().await;
         apns.send_message("com.apple.madrid", request_download, Some(msg_id)).await?;
 
