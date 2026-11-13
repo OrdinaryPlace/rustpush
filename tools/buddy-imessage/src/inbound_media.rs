@@ -248,7 +248,7 @@ mod tests {
     }
 
     fn inline_message(bytes: Vec<u8>) -> (Vec<String>, MessageInst) {
-        let own = vec!["mailto:local@example.test".into()];
+        let own = vec![String::from("mailto:local@example.test")];
         let sender = "mailto:remote@example.test";
         let audience = ConversationData { participants: vec![own[0].clone(), sender.into()],
             sender_guid: None, cv_name: None, after_guid: None };
