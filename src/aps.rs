@@ -1298,7 +1298,6 @@ impl Resource for APSConnectionResource {
             loop {
                 match APSMessage::read_from_stream(&mut read, &mut decoder).await {
                     Ok(Some(msg)) => {
-                        let _ = maintenance_self.messages.read().await.as_ref().unwrap().send(msg.clone()); // if it fails, someone might care later
                         let mut ingress = maintenance_self.ingress.lock().await;
                         if ingress.generation != generation { return; }
                         let Some(next) = ingress.sequence.checked_add(1) else {
@@ -1306,7 +1305,9 @@ impl Resource for APSConnectionResource {
                             return;
                         };
                         ingress.sequence = next;
-                        let _ = maintenance_self.messages_cont.send(msg);
+                        let _ = maintenance_self.messages_cont.send(msg.clone());
+                        drop(ingress);
+                        let _ = maintenance_self.messages.read().await.as_ref().unwrap().send(msg);
                     },
                     Ok(None) => {},
                     Err(err) => {
