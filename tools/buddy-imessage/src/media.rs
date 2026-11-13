@@ -157,6 +157,15 @@ fn jpeg(bytes: &[u8]) -> Result<(u32, u32)> {
     Err(WorkerError("invalid_image_format"))
 }
 
+pub fn validate_image(bytes: &[u8], mime: MediaType) -> Result<(u32, u32)> {
+    if bytes.is_empty() || bytes.len() > MAX_MEDIA_BYTES { return Err(WorkerError("invalid_image_format")); }
+    match mime {
+        MediaType::Png => png(bytes),
+        MediaType::Jpeg => jpeg(bytes),
+        _ => Err(WorkerError("invalid_image_format")),
+    }
+}
+
 const INVALID_MP4: WorkerError = WorkerError("invalid_mp4_format");
 
 fn mp4_box<'a>(remaining: &mut &'a [u8]) -> Result<(&'a [u8], &'a [u8])> {
@@ -220,8 +229,7 @@ pub fn read_artifact(directory: &Path, id: &str, conversation: &Conversation) ->
         return Err(WorkerError("media_artifact_changed"));
     }
     let dimensions = match manifest.mime {
-        MediaType::Png => Some(png(&bytes)?),
-        MediaType::Jpeg => Some(jpeg(&bytes)?),
+        MediaType::Png | MediaType::Jpeg => Some(validate_image(&bytes, manifest.mime)?),
         MediaType::M4a => { mp4(&bytes, false)?; None },
         MediaType::Mp4 => { mp4(&bytes, true)?; None },
     };

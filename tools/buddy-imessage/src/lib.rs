@@ -262,6 +262,7 @@ pub enum Command {
     Disconnect { id: String },
     Typing { id: String, conversation: Conversation, active: bool },
     Status { id: String, operation_id: String },
+    FetchInboundImage { id: String, message_guid: String, artifact_id: String },
     SendText { id: String, conversation: Conversation, text: String },
     SendFeedback { id: String, conversation: Conversation, text: String },
     SendPoll { id: String, conversation: Conversation, question: String, options: Vec<String> },
@@ -277,7 +278,7 @@ impl Command {
         match self {
             Self::Validate { id } | Self::Connect { id } | Self::Disconnect { id }
             | Self::Typing { id, .. }
-            | Self::Status { id, .. } | Self::SendText { id, .. } | Self::SendPoll { id, .. }
+            | Self::Status { id, .. } | Self::FetchInboundImage { id, .. } | Self::SendText { id, .. } | Self::SendPoll { id, .. }
             | Self::SendFeedback { id, .. }
             | Self::PrepareText { id, .. } | Self::PreparePoll { id, .. } | Self::PrepareImage { id, .. }
             | Self::PrepareMedia { id, .. } | Self::Dispatch { id, .. } => id,

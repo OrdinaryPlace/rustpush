@@ -1,4 +1,4 @@
-use std::{io::Cursor, collections::HashMap};
+use std::{io::Cursor, collections::HashMap, sync::LazyLock, time::Duration};
 
 use crate::{APSConnectionResource, aps::get_message, error::PushError, mmcsp::{self, Container as ProtoContainer, FordChunk, FordChunkItem, FordItem, HttpRequest, authorize_get_response, authorize_put::put_data::{Chunk, FordDesc}, authorize_put_response::{UploadTarget, upload_target::ChunkIdentifier}}, util::{REQWEST, REQWEST_NO_TIMEOUT, decode_hex, encode_hex, plist_to_bin}};
 use aes::Aes256;
@@ -41,6 +41,47 @@ pub struct MMCSConfig {
     pub extra_2: Option<String>,
 }
 
+static ATTACHMENT_DOWNLOAD: LazyLock<Client> = LazyLock::new(|| Client::builder()
+    .use_rustls_tls().https_only(true).redirect(reqwest::redirect::Policy::none()).no_proxy()
+    .connect_timeout(Duration::from_secs(5)).timeout(Duration::from_secs(20))
+    .add_root_certificate(reqwest::Certificate::from_der(include_bytes!("../../certs/root/AppleIncRootCertificate.cer")).unwrap())
+    .add_root_certificate(reqwest::Certificate::from_der(include_bytes!("../../certs/root/AppleRootCA-G2.cer")).unwrap())
+    .add_root_certificate(reqwest::Certificate::from_der(include_bytes!("../../certs/root/AppleRootCA-G3.cer")).unwrap())
+    .build().expect("attachment HTTP client"));
+
+pub(crate) fn apple_attachment_host(host: &str) -> bool {
+    !host.is_empty() && host.len() <= 253 && host.split('.').all(|label| !label.is_empty()
+        && label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))
+        && [".icloud.com", ".icloud-content.com", ".apple.com", ".apple-cloudkit.com"].iter()
+            .any(|suffix| host.ends_with(suffix))
+}
+
+fn bounded_container_request(req: &HttpRequest) -> bool {
+    req.scheme == "https" && req.port == 443 && req.method == "GET" && apple_attachment_host(&req.domain)
+        && req.path.starts_with('/') && !req.path.starts_with("//") && req.path.len() <= 4096
+        && req.path.bytes().all(|byte| byte.is_ascii_graphic() && !b"\\#".contains(&byte))
+}
+
+fn bounded_container_size(container: &ProtoContainer, size: usize) -> Result<usize, PushError> {
+    if !container.request.as_ref().is_some_and(bounded_container_request)
+        || container.chunks.is_empty() || container.chunks.len() > 128 {
+        return Err(invalid_attachment());
+    }
+    let mut end = 0usize;
+    for chunk in &container.chunks {
+        let meta = chunk.meta.as_ref().ok_or_else(invalid_attachment)?;
+        let offset = usize::try_from(meta.offset).map_err(|_| invalid_attachment())?;
+        let chunk_size = usize::try_from(meta.size).map_err(|_| invalid_attachment())?;
+        if chunk_size == 0 || offset < end || meta.checksum.len() != 21 || meta.encryption_key.is_some() {
+            return Err(invalid_attachment());
+        }
+        end = offset.checked_add(chunk_size).filter(|end| *end <= size).ok_or_else(invalid_attachment)?;
+    }
+    Ok(end)
+}
+
+fn invalid_attachment() -> PushError { PushError::MMCSGetFailed(None) }
+
 async fn send_mmcs_req(client: &Client, config: &MMCSConfig, url: &str, method: &str, auth: &str, dsid: &str, body: &[u8]) -> Result<Response, PushError> {
     let cloudkit_headers: HeaderMap = config.cloudkit_headers.iter().map(|(a, b)| (HeaderName::from_str(a).unwrap(), b.parse().unwrap())).collect();
 
@@ -67,9 +108,9 @@ async fn send_mmcs_req(client: &Client, config: &MMCSConfig, url: &str, method: 
 
 // build confirm request, mostly a bunch of analytics I don't care to track accurately
 fn confirm_for_resp(resp: &Response, url: &str, conf_token: &str, up_md5: Option<&[u8]>) -> mmcsp::confirm_response::Request {
-    let edge_info = resp.headers().get("x-apple-edge-info").clone().map(|i| i.to_str().unwrap().to_string());
+    let edge_info = resp.headers().get("x-apple-edge-info").and_then(|value| value.to_str().ok()).map(str::to_owned);
     let status = resp.status();
-    let etag = resp.headers().get("ETag").clone().map(|i| i.to_str().unwrap().to_string());
+    let etag = resp.headers().get("ETag").and_then(|value| value.to_str().ok()).map(str::to_owned);
     mmcsp::confirm_response::Request {
         url: url.to_string(),
         status: status.as_u16() as u32,
@@ -621,7 +662,7 @@ pub async fn transfer_mmcs_container(client: &Client, req: &HttpRequest, body: O
         .header("user-agent", user_agent);
     let completing_at_edge = complete_req_at_edge(req);
     for header in &req.headers {
-        if (header.name == "Content-Length" && completing_at_edge) || header.name == "Host" {
+        if (header.name == "Content-Length" && completing_at_edge) || header.name.eq_ignore_ascii_case("Host") {
             continue // this isn't a rustpush hack, this is how you *think different*
         }
         upload_resp = upload_resp.header(header.name.clone(), header.value.clone());
@@ -938,6 +979,8 @@ struct MMCSGetContainer {
     confirm: Option<MMCSReceipt>,
     transfer_progress: usize,
     user_agent: String,
+    byte_limit: Option<usize>,
+    received_bytes: usize,
 }
 
 impl MMCSGetContainer {
@@ -948,7 +991,9 @@ impl MMCSGetContainer {
             response: None,
             confirm: None,
             transfer_progress: 0,
-            user_agent
+            user_agent,
+            byte_limit: None,
+            received_bytes: 0,
         }
     }
 
@@ -978,7 +1023,12 @@ impl MMCSGetContainer {
     // opens an HTTP stream if not already open
     async fn ensure_stream(&mut self) -> Result<(), PushError> {
         if self.response.is_none() {
-            let response = transfer_mmcs_container(&REQWEST_NO_TIMEOUT, &self.container.request.as_ref().unwrap(), None, &self.user_agent).await?;
+            let client = if self.byte_limit.is_some() { &*ATTACHMENT_DOWNLOAD } else { &*REQWEST_NO_TIMEOUT };
+            let response = transfer_mmcs_container(client, &self.container.request.as_ref().unwrap(), None, &self.user_agent).await?;
+            if self.byte_limit.is_some_and(|limit| !response.status().is_success()
+                || response.content_length().is_some_and(|length| length > limit as u64)) {
+                return Err(invalid_attachment());
+            }
             self.confirm = Some(MMCSReceipt::Get(confirm_for_resp(&response, &get_container_url(&self.container.request.as_ref().unwrap()), &self.container.cl_auth_p2, None)));
             self.response = Some(response);
         }
@@ -999,6 +1049,10 @@ impl ReadContainer for MMCSGetContainer {
             let Some(bytes) = self.response.as_mut().unwrap().chunk().await? else {
                 return Ok(self.cacher.read_all())
             };
+            if let Some(limit) = self.byte_limit {
+                self.received_bytes = self.received_bytes.checked_add(bytes.len()).filter(|size| *size <= limit)
+                    .ok_or_else(invalid_attachment)?;
+            }
             self.cacher.data_avail(&bytes);
             received = self.cacher.read_exact(len);
         }
@@ -1033,6 +1087,68 @@ pub async fn authorize_get(config: &MMCSConfig, url: &str, files: &[(Vec<u8>, &s
         body: request.bytes().await?.into(),
         dsid: config.dsid.clone().unwrap()
     })
+}
+
+/// Read one size-bound ordinary iMessage object using only validated Apple
+/// container endpoints. Legacy shared streams and CloudKit use get_mmcs.
+pub(crate) async fn get_mmcs_bounded(config: &MMCSConfig, authorized: AuthorizedOperation,
+    signature: &[u8], size: usize) -> Result<Vec<u8>, PushError> {
+    if authorized.body.len() > 256 * 1024 { return Err(invalid_attachment()); }
+    let response = mmcsp::AuthorizeGetResponse::decode(authorized.body.as_slice())?
+        .f1.ok_or_else(invalid_attachment)?;
+    if response.containers.is_empty() || response.containers.len() > 32 || response.references.len() != 1 {
+        return Err(invalid_attachment());
+    }
+    let reference = &response.references[0];
+    if reference.file_checksum != signature || reference.ford_reference.is_some()
+        || reference.chunk_references.is_empty() || reference.chunk_references.len() > 128 {
+        return Err(invalid_attachment());
+    }
+    let mut sources = Vec::new();
+    let mut transfer_size = 0usize;
+    for container in &response.containers {
+        let end = bounded_container_size(container, size)?;
+        transfer_size = transfer_size.checked_add(end).filter(|total| *total <= size).ok_or_else(invalid_attachment)?;
+        let mut source = MMCSGetContainer::new(container.clone(), config.user_agent.clone());
+        source.byte_limit = Some(end);
+        sources.push(ChunkedContainer::new(source.get_chunks(&HashMap::new()), source));
+    }
+    let mut target_size = 0usize;
+    let mut chunks = Vec::new();
+    for chunk in &reference.chunk_references {
+        let source = sources.get(chunk.container_index as usize).ok_or_else(invalid_attachment)?;
+        let mut chunk = *source.chunks.get(chunk.chunk_index as usize).ok_or_else(invalid_attachment)?;
+        target_size = target_size.checked_add(chunk.size).filter(|total| *total <= size).ok_or_else(invalid_attachment)?;
+        chunk.offset = None;
+        chunks.push(chunk);
+    }
+    if target_size != size { return Err(invalid_attachment()); }
+    let mut encrypted = Vec::new();
+    let target = ChunkedContainer::new(chunks, FileContainer::new(Cursor::new(&mut encrypted)));
+    let mut matcher = MMCSMatcher { sources, targets: vec![target], reciepts: vec![], total: size };
+    matcher.transfer_chunks(config, |_, _| {}).await?;
+    if !matcher.targets[0].complete() { return Err(invalid_attachment()); }
+    let confirmation = mmcsp::ConfirmResponse {
+        inner: matcher.get_confirm_reciepts().iter().filter_map(|receipt| match receipt {
+            MMCSReceipt::Get(receipt) => Some(receipt.clone()),
+            _ => None,
+        }).collect(),
+        confirm_data: None,
+    };
+    drop(matcher);
+    if encrypted.len() != size { return Err(invalid_attachment()); }
+    // The authenticated message descriptor signs the complete encrypted file.
+    let mut hash = Sha1::new();
+    hash.update(b"com.apple.XattrObjectSalt\0com.apple.DataObjectSalt\0");
+    hash.update(&encrypted);
+    if signature.get(1..) != Some(hash.finish().as_slice()) { return Err(invalid_attachment()); }
+
+    let container = &response.containers[0];
+    let auth = format!("{} {}", container.cl_auth_p1, container.cl_auth_p2);
+    let receipt = send_mmcs_req(&ATTACHMENT_DOWNLOAD, config, &authorized.url, "getComplete", &auth,
+        &authorized.dsid, &confirmation.encode_to_vec()).await?;
+    if !receipt.status().is_success() { return Err(invalid_attachment()); }
+    Ok(encrypted)
 }
 
 pub async fn get_mmcs(config: &MMCSConfig, authorized: AuthorizedOperation, files: Vec<(Vec<u8>, &str, impl WriteContainer + Send + Sync, Option<Vec<u8>>)>, progress: impl FnMut(usize, usize) + Send + Sync, ford: bool) -> Result<(), PushError> {
@@ -1166,4 +1282,49 @@ pub async fn get_mmcs(config: &MMCSConfig, authorized: AuthorizedOperation, file
     }
 
     Ok(())
+}
+
+
+#[cfg(test)]
+mod bounded_attachment_tests {
+    use super::*;
+    use mmcsp::container::{ChunkMeta, ChunkWrapper};
+
+    fn container() -> ProtoContainer {
+        ProtoContainer {
+            request: Some(HttpRequest { domain: "content.example.icloud.com".into(),
+                port: 443, method: "GET".into(), scheme: "https".into(), path: "/sample".into(),
+                ..Default::default() }),
+            chunks: vec![ChunkWrapper { meta: Some(ChunkMeta { checksum: vec![1; 21],
+                size: 12, offset: 0, encryption_key: None }), encryption: None }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn validates_apple_https_container_and_exact_byte_range_before_network() {
+        let valid = container();
+        assert_eq!(bounded_container_size(&valid, 12).unwrap(), 12);
+        assert!(bounded_container_size(&valid, 11).is_err());
+        for domain in ["127.0.0.1", "usercontent.icloud.com.example.test", "abc@content.icloud.com",
+            "content.icloud.com/private", "content.icloud.com:80"] {
+            let mut invalid = valid.clone();
+            invalid.request.as_mut().unwrap().domain = domain.into();
+            assert!(bounded_container_size(&invalid, 12).is_err());
+        }
+        for port in [80, 444] {
+            let mut invalid = valid.clone();
+            invalid.request.as_mut().unwrap().port = port;
+            assert!(bounded_container_size(&invalid, 12).is_err());
+        }
+        let mut invalid = valid.clone();
+        invalid.request.as_mut().unwrap().method = "PUT".into();
+        assert!(bounded_container_size(&invalid, 12).is_err());
+        let mut invalid = valid.clone();
+        invalid.chunks[0].meta.as_mut().unwrap().offset = u64::MAX;
+        assert!(bounded_container_size(&invalid, 12).is_err());
+        let mut invalid = valid;
+        invalid.chunks[0].meta.as_mut().unwrap().checksum.clear();
+        assert!(bounded_container_size(&invalid, 12).is_err());
+    }
 }
