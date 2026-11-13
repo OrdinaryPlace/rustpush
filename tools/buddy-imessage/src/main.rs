@@ -396,11 +396,12 @@ impl Worker {
             loop {
                 match receive.recv().await {
                     Ok(message) => {
+                        let notification = matches!(&message, rustpush::APSMessage::Notification { .. });
                         let result = recv_client.handle(message).await;
                         let ingress = recv_client.conn.ingress_snapshot().await;
                         let received_at_ms = epoch_ms();
                         let membership = group_incoming.lock().ok().and_then(|mut roster| {
-                            roster.processed(ingress);
+                            if notification { roster.processed(ingress); }
                             match &result {
                                 Ok(Some(message)) => roster.observe(message, &actor_for_receive, &actual_handles,
                                     connected_at_ms, received_at_ms),

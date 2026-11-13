@@ -1300,11 +1300,13 @@ impl Resource for APSConnectionResource {
                     Ok(Some(msg)) => {
                         let mut ingress = maintenance_self.ingress.lock().await;
                         if ingress.generation != generation { return; }
-                        let Some(next) = ingress.sequence.checked_add(1) else {
-                            ingress.active = false;
-                            return;
-                        };
-                        ingress.sequence = next;
+                        if matches!(&msg, APSMessage::Notification { .. }) {
+                            let Some(next) = ingress.sequence.checked_add(1) else {
+                                ingress.active = false;
+                                return;
+                            };
+                            ingress.sequence = next;
+                        }
                         let _ = maintenance_self.messages_cont.send(msg.clone());
                         drop(ingress);
                         let _ = maintenance_self.messages.read().await.as_ref().unwrap().send(msg);
