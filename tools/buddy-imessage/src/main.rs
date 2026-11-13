@@ -514,13 +514,12 @@ impl Worker {
         if conversation.participants.len() > 2 && group_guard.is_none() {
             return Err(WorkerError("group_guard_required"));
         }
-        let bound_conversation;
-        let conversation = if let Some(guard) = group_guard {
+        let group_binding = if let Some(guard) = group_guard {
             let connected = self.connected.as_ref().ok_or(WorkerError("not_connected"))?;
-            bound_conversation = connected.group_roster.lock().map_err(|_| WorkerError("group_membership_changed"))?
-                .bind(conversation, guard, epoch_ms())?;
-            &bound_conversation
-        } else { conversation };
+            Some(connected.group_roster.lock().map_err(|_| WorkerError("group_membership_changed"))?
+                .bind(conversation, guard, epoch_ms())?)
+        } else { None };
+        let conversation = group_binding.as_ref().map_or(conversation, |binding| &binding.conversation);
         conversation.validate(&bundle.preferred_handle)?;
         if feedback { validate_typing_conversation(conversation, &bundle.preferred_handle, &[bundle.preferred_handle.clone()])?; }
         let digest = fingerprint(command)?;
@@ -545,6 +544,7 @@ impl Worker {
             (NormalMessage::new(text.clone(), MessageType::IMessage), None, None)
         };
         let mut message = MessageInst::new(conversation.protocol(), &bundle.preferred_handle, Message::Message(normal));
+        message.participant_version = group_binding.map(|binding| binding.participant_version);
         // Persist stable group/DM and MessageInst GUIDs before crossing the
         // network boundary. Subsequent prepare_send calls keep these GUIDs,
         // but refresh the wire timestamp.
@@ -583,7 +583,8 @@ impl Worker {
                 || !group_roster::operation_matches(guard, conversation) {
                 return Err(WorkerError("invalid_group_guard"));
             }
-            Some(transport_guard(connected.group_roster.clone(), guard.clone(), epoch_ms))
+            let participant_version = operation.message.participant_version.ok_or(WorkerError("invalid_group_guard"))?;
+            Some(transport_guard(connected.group_roster.clone(), guard.clone(), participant_version, epoch_ms))
         } else {
             if conversation.is_group() { return Err(WorkerError("group_guard_required")); }
             None

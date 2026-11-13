@@ -97,6 +97,7 @@ impl IDSRecvMessage {
             send_delivered: send_delivered.unwrap_or(false),
             verification_failed: self.verification_failed,
             authenticated_madrid_payload: self.authenticated_madrid_payload,
+            participant_version: None,
             certified_context: self.certified_context(),
         })
     }
@@ -202,6 +203,7 @@ impl IMClient {
                 send_delivered: false,
                 verification_failed: false,
                 authenticated_madrid_payload: false,
+                participant_version: None,
                 certified_context: None,
             }))
         }

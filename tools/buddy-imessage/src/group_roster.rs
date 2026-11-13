@@ -13,7 +13,7 @@ const MAX_BINDINGS: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Membership {
-    generation: Uuid,
+    generation: String,
     revision: u64,
     participants: Vec<String>,
 }
@@ -22,6 +22,12 @@ struct Observation {
     membership: Membership,
     conversation: Conversation,
     received_at_ms: u64,
+    participant_version: u64,
+}
+
+pub struct GroupSendBinding {
+    pub conversation: Conversation,
+    pub participant_version: u64,
 }
 
 pub struct GroupRoster {
@@ -109,6 +115,10 @@ impl GroupRoster {
             if self.bindings.contains_key(&thread) { self.invalidate(thread); }
             return None;
         };
+        let Some(participant_version) = message.participant_version else {
+            if self.bindings.contains_key(&thread) { self.invalidate(thread); }
+            return None;
+        };
         let actor_handle = canonical_handle(actor)?;
         let own: Vec<_> = own_handles.iter().filter_map(|handle| canonical_handle(handle)).collect();
         let sender = message.sender.as_deref().and_then(canonical_handle);
@@ -123,7 +133,7 @@ impl GroupRoster {
             && message.sent_timestamp >= connected_at_ms
             && received_at_ms.checked_sub(message.sent_timestamp).is_some_and(|age| age <= MAX_ROSTER_AGE_MS);
         if let Some(current) = self.bindings.get_mut(&thread) {
-            if current.membership.participants != roster {
+            if current.membership.participants != roster || current.participant_version != participant_version {
                 self.invalidate(thread);
                 return None;
             }
@@ -136,21 +146,23 @@ impl GroupRoster {
         if !fresh || sender.as_ref().is_some_and(|sender| own.contains(sender)) { return None; }
         if self.bindings.len() >= MAX_BINDINGS { self.invalidate_all(); return None; }
         self.revision += 1;
-        let membership = Membership { generation: self.generation, revision: self.revision, participants: roster };
+        let membership = Membership { generation: self.generation.to_string(), revision: self.revision, participants: roster };
         let conversation = Conversation { participants: conversation.participants.clone(),
             sender_guid: conversation.sender_guid.clone(), cv_name: conversation.cv_name.clone(), after_guid: None };
-        self.bindings.insert(thread, Observation { membership: membership.clone(), conversation, received_at_ms });
+        self.bindings.insert(thread, Observation { membership: membership.clone(), conversation, received_at_ms,
+            participant_version });
         Some(membership)
     }
 
-    pub fn bind(&self, conversation: &Conversation, guard: &GroupGuard, now_ms: u64) -> Result<Conversation> {
+    pub fn bind(&self, conversation: &Conversation, guard: &GroupGuard, now_ms: u64) -> Result<GroupSendBinding> {
         let thread = thread_id(conversation.sender_guid.as_deref()).ok_or(WorkerError("invalid_group_guard"))?;
         if thread_id(Some(&guard.sender_guid)) != Some(thread) || guard.revision == 0
             || exact_roster(&guard.participants).is_none() || exact_roster(&guard.participants) != exact_roster(&conversation.participants)
             || conversation.after_guid.is_some() || conversation.cv_name.is_some() {
             return Err(WorkerError("invalid_group_guard"));
         }
-        self.current(guard, now_ms).map(|binding| binding.conversation.clone()).ok_or(WorkerError("group_membership_changed"))
+        self.current(guard, now_ms).map(|binding| GroupSendBinding { conversation: binding.conversation.clone(),
+            participant_version: binding.participant_version }).ok_or(WorkerError("group_membership_changed"))
     }
 
     fn current(&self, guard: &GroupGuard, now_ms: u64) -> Option<&Observation> {
@@ -159,16 +171,17 @@ impl GroupRoster {
         let generation = thread_id(Some(&guard.generation))?;
         let roster = exact_roster(&guard.participants)?;
         let binding = self.bindings.get(&thread)?;
-        (binding.membership.generation == generation && binding.membership.revision == guard.revision
+        (self.generation == generation && binding.membership.revision == guard.revision
             && binding.membership.participants == roster
             && now_ms.checked_sub(binding.received_at_ms).is_some_and(|age| age <= MAX_ROSTER_AGE_MS)).then_some(binding)
     }
 }
 
-pub fn transport_guard(roster: Arc<Mutex<GroupRoster>>, guard: GroupGuard, now_ms: fn() -> u64) -> APSSendGuard {
+pub fn transport_guard(roster: Arc<Mutex<GroupRoster>>, guard: GroupGuard,
+    participant_version: u64, now_ms: fn() -> u64) -> APSSendGuard {
     Arc::new(move |ingress| roster.lock().is_ok_and(|roster| {
         ingress.active && roster.aps_generation == ingress.generation && roster.processed == ingress.sequence
-            && roster.current(&guard, now_ms()).is_some()
+            && roster.current(&guard, now_ms()).is_some_and(|binding| binding.participant_version == participant_version)
     }))
 }
 
@@ -196,6 +209,7 @@ mod tests {
             Message::Message(NormalMessage::new("Synthetic".into(), MessageType::IMessage)));
         message.sent_timestamp = NOW - 1;
         message.authenticated_madrid_payload = true;
+        message.participant_version = Some(3);
         message
     }
 
@@ -205,7 +219,7 @@ mod tests {
 
     fn group_guard(thread: &str, membership: &Membership) -> GroupGuard {
         GroupGuard { sender_guid: thread.into(), participants: membership.participants.clone(),
-            generation: membership.generation.to_string(), revision: membership.revision }
+            generation: membership.generation.clone(), revision: membership.revision }
     }
 
     #[test]
@@ -220,8 +234,9 @@ mod tests {
         let request = Conversation { participants: membership.participants, sender_guid: Some(THREAD.into()),
             cv_name: None, after_guid: None };
         let bound = roster.bind(&request, &guard, NOW).unwrap();
-        assert!(bound.participants.contains(&"mailto:Participant-A@example.test".into()));
-        assert_eq!(bound.cv_name.as_deref(), Some("Synthetic"));
+        assert!(bound.conversation.participants.contains(&"mailto:Participant-A@example.test".into()));
+        assert_eq!(bound.conversation.cv_name.as_deref(), Some("Synthetic"));
+        assert_eq!(bound.participant_version, 3);
         assert!(roster.bind(&request, &guard, NOW + MAX_ROSTER_AGE_MS + 1).is_err());
     }
 
@@ -233,6 +248,9 @@ mod tests {
         external.authenticated_madrid_payload = false;
         assert!(observe(&mut roster, &external).is_none());
         external.authenticated_madrid_payload = true;
+        external.participant_version = None;
+        assert!(observe(&mut roster, &external).is_none());
+        external.participant_version = Some(3);
         external.sent_timestamp = START - 1;
         assert!(observe(&mut roster, &external).is_none());
     }
@@ -245,9 +263,11 @@ mod tests {
         let sibling = message(SIBLING, PEER_A, &[ACTOR, PEER_A, PEER_B]);
         let sibling_membership = observe(&mut roster, &sibling).unwrap();
         let roster = Arc::new(Mutex::new(roster));
-        let guard = transport_guard(roster.clone(), group_guard(THREAD, &membership), || NOW);
-        let sibling_guard = transport_guard(roster.clone(), group_guard(SIBLING, &sibling_membership), || NOW);
+        let guard = transport_guard(roster.clone(), group_guard(THREAD, &membership), 3, || NOW);
+        let sibling_guard = transport_guard(roster.clone(), group_guard(SIBLING, &sibling_membership), 3, || NOW);
+        let wrong_version = transport_guard(roster.clone(), group_guard(THREAD, &membership), 2, || NOW);
         assert!(guard(ingress(1, 0)));
+        assert!(!wrong_version(ingress(1, 0)));
         assert!(!guard(ingress(1, 1)));
         assert!(!guard(ingress(2, 0)));
         {
@@ -262,5 +282,19 @@ mod tests {
         }
         assert!(!guard(ingress(1, 1)));
         assert!(sibling_guard(ingress(1, 1)));
+    }
+
+    #[test]
+    fn a_conflicting_native_version_retires_the_binding_even_with_the_same_roster() {
+        let mut roster = GroupRoster::new(ingress(1, 0));
+        let mut first = message(THREAD, PEER_A, &[ACTOR, PEER_A, PEER_B]);
+        first.participant_version = Some(0);
+        let membership = observe(&mut roster, &first).unwrap();
+        let mut changed = first.clone();
+        changed.participant_version = Some(1);
+        assert!(observe(&mut roster, &changed).is_none());
+        assert!(observe(&mut roster, &first).is_none());
+        let roster = Arc::new(Mutex::new(roster));
+        assert!(!transport_guard(roster, group_guard(THREAD, &membership), 0, || NOW)(ingress(1, 0)));
     }
 }
