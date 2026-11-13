@@ -1549,8 +1549,43 @@ impl MMCSFile {
         })
     }
 
+    fn attachment_base_url(&self) -> Option<reqwest::Url> {
+        if self.url.len() > 4096 || !self.url.bytes().all(|byte| byte.is_ascii_graphic() && byte != b'\\')
+            || self.object.is_empty() || self.object.len() > 256
+            || !self.object.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+            || matches!(self.object.as_str(), "." | "..") {
+            return None;
+        }
+        let url = reqwest::Url::parse(&self.url).ok()?;
+        if url.scheme() != "https" || url.port_or_known_default() != Some(443) || !url.username().is_empty()
+            || url.password().is_some() || url.query().is_some() || url.fragment().is_some()
+            || !url.host_str().is_some_and(mmcs::apple_attachment_host) {
+            return None;
+        }
+        if url.path_segments()?.next_back()? != self.object { return None; }
+        Some(url)
+    }
+
+    pub fn is_bounded_attachment(&self, limit: usize) -> bool {
+        self.size > 0 && self.size <= limit && self.key.len() == 32 && self.signature.len() == 21
+            && self.attachment_base_url().is_some()
+    }
+
+    /// Download only the bounded authenticated iMessage attachment referenced
+    /// by this descriptor. The caller must authorize the source message.
+    pub async fn get_attachment_bounded(&self, apns: &APSConnectionResource, writer: impl Write + Send + Sync,
+        limit: usize) -> Result<(), PushError> {
+        if !self.is_bounded_attachment(limit) { return Err(PushError::MMCSGetFailed(None)); }
+        self.transfer_attachment(apns, writer, |_, _| {}, true).await
+    }
+
     // request to get and download attachment from MMCS
     pub async fn get_attachment(&self, apns: &APSConnectionResource, writer: impl Write + Send + Sync, progress: impl FnMut(usize, usize) + Send + Sync) -> Result<(), PushError> {
+        self.transfer_attachment(apns, writer, progress, false).await
+    }
+
+    async fn transfer_attachment(&self, apns: &APSConnectionResource, mut writer: impl Write + Send + Sync,
+        progress: impl FnMut(usize, usize) + Send + Sync, bounded: bool) -> Result<(), PushError> {
         #[derive(Serialize, Deserialize)]
         struct RequestMMCSDownload {
             #[serde(rename = "mO")]
@@ -1587,9 +1622,13 @@ impl MMCSFile {
             extra_2: None,
         };
 
-        let recieve_container = IMessageContainer::new(&self.key, writer, true);
-
-        let domain = self.url.replace(&format!("/{}", &self.object), "");
+        let domain = if bounded {
+            let url = self.attachment_base_url().ok_or(PushError::MMCSGetFailed(None))?;
+            let path = url.path().rsplit_once('/').ok_or(PushError::MMCSGetFailed(None))?.0;
+            format!("{}{}", url.origin().ascii_serialization(), path)
+        } else {
+            self.url.replace(&format!("/{}", &self.object), "")
+        };
         let msg_id = new_aps_id();
         let header = format!("x-mme-client-info:{}", mmcs_config.mme_client_info);
         let request_download = RequestMMCSDownload {
@@ -1616,15 +1655,9 @@ impl MMCSFile {
         apns.send_message("com.apple.madrid", request_download, Some(msg_id)).await?;
 
         let reader = apns.wait_for_timeout(recv, get_message(|loaded| {
-            let Some(c) = loaded.as_dictionary().unwrap().get("c") else {
-                return None
-            };
-            let Some(i) = loaded.as_dictionary().unwrap().get("i") else {
-                return None
-            };
-            if c.as_unsigned_integer().unwrap() == 151 && i.as_signed_integer().unwrap() as i32 == msg_id {
-                Some(loaded)
-            } else { None }
+            let values = loaded.as_dictionary()?;
+            (values.get("c")?.as_unsigned_integer()? == 151
+                && values.get("i")?.as_signed_integer()? == i64::from(msg_id)).then_some(loaded)
         }, &["com.apple.madrid"])).await?;
         let apns_response: MMCSDownloadResponse = plist::from_value(&reader)?;
 
@@ -1634,8 +1667,16 @@ impl MMCSFile {
             dsid: apns_response.object,
         };
 
-        get_mmcs(&mmcs_config, authorized, vec![(self.signature.clone(), &self.object, recieve_container, None)], progress, false).await?;
-
+        if bounded {
+            let encrypted = mmcs::get_mmcs_bounded(&mmcs_config, authorized, &self.signature, self.size).await?;
+            let plaintext = openssl::symm::decrypt(Cipher::aes_256_ctr(), &self.key, Some(&ZERO_NONCE), &encrypted)?;
+            if plaintext.len() != self.size { return Err(PushError::MMCSGetFailed(None)); }
+            writer.write_all(&plaintext)?;
+        } else {
+            let receive_container = IMessageContainer::new(&self.key, writer, true);
+            get_mmcs(&mmcs_config, authorized, vec![(self.signature.clone(), &self.object, receive_container, None)],
+                progress, false).await?;
+        }
         Ok(())
     }
 }

@@ -12,13 +12,16 @@ use std::future::Future;
 use buddy_imessage::*;
 use keystore::{init_keystore, software::{NoEncryptor, SoftwareKeystore, SoftwareKeystoreState}};
 use rustpush::{APSConnection, APSConnectionResource, APSState, IDSNGMIdentity, IDSUser,
-    IMClient, MADRID_SERVICE, Message, MessageInst, MessageType, NormalMessage, OSConfig, SendJob, SendResult};
+    IMClient, MADRID_SERVICE, Message, MessageInst, MessagePart, MessageType, NormalMessage, OSConfig, SendJob, SendResult};
 use rustpush::polls::{NativePollPayload, PollPayload};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+mod inbound_media;
+use inbound_media::PendingImages;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct PollMetadata { session_id: String, option_ids: Vec<String> }
@@ -68,6 +71,7 @@ struct Connected {
     actor: String,
     session: Arc<Mutex<SessionExport>>,
     tasks: Vec<JoinHandle<()>>,
+    inbound_images: Arc<Mutex<PendingImages>>,
 }
 
 impl Drop for Connected {
@@ -92,7 +96,7 @@ const FEEDBACK_SEND_BUDGET: Duration = Duration::from_secs(2);
 const MEDIA_UPLOAD_BUDGET: Duration = Duration::from_secs(60);
 
 fn ready_event() -> Value {
-    json!({"event":"ready","connected":false,"network_contacted":false,"capabilities":{"typing":true,"feedback":true,"images":true,"media":true}})
+    json!({"event":"ready","connected":false,"network_contacted":false,"capabilities":{"typing":true,"feedback":true,"images":true,"media":true,"inbound_images":true}})
 }
 
 async fn typing_status<F, E>(send: F, budget: Duration) -> &'static str
@@ -378,11 +382,13 @@ impl Worker {
         let output = self.output.clone();
         let recv_client = client.clone();
         let connected_at_ms = epoch_ms();
+        let inbound_images = Arc::new(Mutex::new(PendingImages::default()));
+        let incoming = inbound_images.clone();
         let receive_task = tokio::spawn(async move {
             loop {
                 match receive.recv().await {
                     Ok(message) => match recv_client.handle(message).await {
-                        Ok(Some(message)) => emit_inbound(&output, &actual_handles, message, connected_at_ms).await,
+                        Ok(Some(message)) => emit_inbound(&output, &actual_handles, message, connected_at_ms, &incoming).await,
                         Ok(None) => {},
                         Err(_) => emit(&output, json!({"event":"transport_error","code":"inbound_decode_failed"})).await,
                     },
@@ -418,7 +424,7 @@ impl Worker {
                 }
             }
         });
-        self.connected = Some(Connected { connection, client, actor, session, tasks: vec![receive_task, state_task] });
+        self.connected = Some(Connected { connection, client, actor, session, tasks: vec![receive_task, state_task], inbound_images });
         Ok(())
     }
 
@@ -632,6 +638,17 @@ impl Worker {
                 let status = if self.persistence_failed.load(Ordering::SeqCst) { "uncertain" } else { status };
                 emit(&self.output, json!({"event":"typing","id":id,"request_id":id,"active":active,"status":status})).await;
             }
+            Command::FetchInboundImage { message_guid, artifact_id, .. } => {
+                if !inbound_media::valid_binding(message_guid, artifact_id) {
+                    return Err(WorkerError("invalid_inbound_image_binding"));
+                }
+                if self.persistence_failed.load(Ordering::SeqCst) { return Err(WorkerError("state_persist_failed")); }
+                let connected = self.connected.as_ref().ok_or(WorkerError("not_connected"))?;
+                let image = connected.inbound_images.lock().map_err(|_| WorkerError("inbound_image_unavailable"))?
+                    .take(message_guid, artifact_id)?;
+                let event = inbound_media::fetch(image, &self.work_dir, &connected.connection, &id).await?;
+                emit(&self.output, event).await;
+            }
             Command::Status { operation_id, .. } => emit(&self.output, report_operation(&load_operation(&self.work_dir, operation_id)?, &id)).await,
             Command::PrepareText { .. } | Command::PreparePoll { .. } | Command::PrepareImage { .. } | Command::PrepareMedia { .. } => {
                 let operation = self.prepare(&command)?;
@@ -732,7 +749,7 @@ fn error_reason(remote: &str) -> ErrorReason {
     unknown("unrecognized")
 }
 
-fn inbound_event(handles: &[String], message: MessageInst, connected_at_ms: u64, received_at_ms: u64) -> Value {
+fn inbound_event(handles: &[String], message: &MessageInst, connected_at_ms: u64, received_at_ms: u64) -> Value {
     let conversation = message.conversation.as_ref().map(|c| json!({"participants":c.participants,
         "sender_guid":c.sender_guid,"cv_name":c.cv_name,"after_guid":c.after_guid}));
     let mut event = json!({"event":"message","message_id":message.id,"sender":message.sender,
@@ -787,8 +804,24 @@ fn inbound_event(handles: &[String], message: MessageInst, connected_at_ms: u64,
     event
 }
 
-async fn emit_inbound(output: &mpsc::Sender<Value>, handles: &[String], message: MessageInst, connected_at_ms: u64) {
-    emit(output, inbound_event(handles, message, connected_at_ms, epoch_ms())).await;
+async fn emit_inbound(output: &mpsc::Sender<Value>, handles: &[String], message: MessageInst,
+    connected_at_ms: u64, pending: &Mutex<PendingImages>) {
+    let received_at_ms = epoch_ms();
+    let mut event = inbound_event(handles, &message, connected_at_ms, received_at_ms);
+    // The application owns enrollment and replay decisions. Keep only recent
+    // verified direct-message descriptors and never fetch on intake.
+    let recent = message.sent_timestamp > 0 && received_at_ms.abs_diff(message.sent_timestamp) <= 600_000;
+    if let Message::Message(normal) = &message.message {
+        if let Some(descriptor) = inbound_media::describe(handles, &message, pending, recent) {
+            let text: String = normal.parts.0.iter().filter_map(|part| match &part.part {
+                MessagePart::Text(text, _) | MessagePart::Mention(_, text) => Some(text.as_str()),
+                _ => None,
+            }).collect();
+            event["text"] = json!(text);
+            event["inbound_image"] = descriptor;
+        }
+    }
+    emit(output, event).await;
 }
 
 async fn bounded_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Option<Vec<u8>>> {
@@ -859,6 +892,7 @@ async fn run(output: mpsc::Sender<Value>) -> Result<()> {
     let lock = OpenOptions::new().read(true).write(true).create(true).mode(0o600).custom_flags(libc::O_NOFOLLOW)
         .open(work_dir.join("worker.lock")).map_err(|_| WorkerError("worker_lock_failed"))?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 { return Err(WorkerError("worker_already_running")); }
+    inbound_media::clean_if_present(&work_dir);
     emit(&output, ready_event()).await;
     let mut input = BufReader::new(tokio::io::stdin());
     while let Some(line) = bounded_line(&mut input).await? {
@@ -874,6 +908,7 @@ async fn run(output: mpsc::Sender<Value>) -> Result<()> {
         }
     }
     worker.disconnect().await?;
+    inbound_media::clean_if_present(&work_dir);
     drop(lock);
     Ok(())
 }
@@ -940,7 +975,7 @@ mod tests {
     #[test]
     fn ready_advertises_typing_without_connection_or_private_identifiers() {
         assert_eq!(ready_event(), json!({"event":"ready","connected":false,"network_contacted":false,
-            "capabilities":{"typing":true,"feedback":true,"images":true,"media":true}}));
+            "capabilities":{"typing":true,"feedback":true,"images":true,"media":true,"inbound_images":true}}));
     }
 
     fn image_command(directory: &Path) -> Command {
@@ -1354,7 +1389,7 @@ mod tests {
         message.id = "BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB".into();
         message.conversation = None;
         let wrapper = message.id.clone();
-        let event = inbound_event(&[], message, 0, 31_000);
+        let event = inbound_event(&[], &message, 0, 31_000);
         assert_eq!(event["kind"], "error");
         assert_eq!(event["message_type"], "error");
         assert_eq!(event["status"], 802);
@@ -1375,7 +1410,7 @@ mod tests {
         let message = MessageInst::new(conversation.protocol(), "mailto:family@example.test",
             Message::Error(rustpush::ErrorMessage { for_uuid: "INVALID_TARGET_MUST_NOT_LEAK".into(),
                 status: 1, status_str: "REMOTE_TEXT_MUST_NOT_LEAK".into() }));
-        let event = inbound_event(&[], message, 0, 31_000);
+        let event = inbound_event(&[], &message, 0, 31_000);
         assert_eq!(event["error_for_message_id"], Value::Null);
         let encoded = serde_json::to_string(&event).unwrap();
         assert!(!encoded.contains("MUST_NOT_LEAK"));
@@ -1393,7 +1428,7 @@ mod tests {
             let message = MessageInst::new(conversation.protocol(), "mailto:family@example.test",
                 Message::Error(rustpush::ErrorMessage { for_uuid: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA".into(),
                     status: 1, status_str: remote.into() }));
-            let event = inbound_event(&[], message, 0, 31_000);
+            let event = inbound_event(&[], &message, 0, 31_000);
             assert_eq!(event["error_category"], category);
             assert!(!serde_json::to_string(&event).unwrap().contains(remote));
             assert!(event.get("status_str").is_none());
@@ -1408,7 +1443,7 @@ mod tests {
             let message = MessageInst::new(conversation.protocol(), "mailto:family@example.test",
                 Message::Error(rustpush::ErrorMessage { for_uuid: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA".into(),
                     status: 200, status_str: remote.clone() }));
-            let event = inbound_event(&[], message, 0, 31_000);
+            let event = inbound_event(&[], &message, 0, 31_000);
             assert_eq!(event["kind"], "error");
             assert_eq!(event["status"], 200);
             assert_eq!(event["error_domain"], "com.apple.messageprotection");
@@ -1444,7 +1479,7 @@ mod tests {
             let message = MessageInst::new(conversation.protocol(), "mailto:family@example.test",
                 Message::Error(rustpush::ErrorMessage { for_uuid: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA".into(),
                     status: 200, status_str: remote.clone() }));
-            let event = inbound_event(&[], message, 0, 31_000);
+            let event = inbound_event(&[], &message, 0, 31_000);
             assert_eq!(event["error_domain"], Value::Null);
             assert_eq!(event["error_code"], Value::Null);
             assert_eq!(event["error_category"], "unknown");
@@ -1481,7 +1516,7 @@ mod tests {
             let message = MessageInst::new(conversation.protocol(), "mailto:family@example.test",
                 Message::Error(rustpush::ErrorMessage { for_uuid: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA".into(),
                     status: 200, status_str: remote.into() }));
-            let event = inbound_event(&[], message, 0, 31_000);
+            let event = inbound_event(&[], &message, 0, 31_000);
             assert_eq!(event["error_reason_shape"], shape);
             assert_eq!(event["error_reason_length"], remote.len());
             assert_eq!(event["error_message_protection_component_present"], component);
@@ -1512,7 +1547,7 @@ mod tests {
     fn unsupported_message_exposes_only_static_variant_category() {
         let Command::PreparePoll { conversation, .. } = poll_command() else { panic!("Expected poll command") };
         let message = MessageInst::new(conversation.protocol(), "mailto:family@example.test", Message::Typing(false, None));
-        let event = inbound_event(&[], message, 0, 31_000);
+        let event = inbound_event(&[], &message, 0, 31_000);
         assert_eq!(event["kind"], "unsupported");
         assert_eq!(event["message_type"], "typing");
         assert!(event.get("text").is_none());

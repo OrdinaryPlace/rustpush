@@ -245,6 +245,31 @@ receipts are emitted as separate inbound evidence; phone observation remains
 a separate check. Operation records and `status` responses include GUIDs and
 poll metadata, not private keys or credentials.
 
+## Inbound images
+
+A recent, verified direct iMessage with one supported JPEG or PNG attachment
+retains its accompanying text in the ordinary message event. When the worker
+advertises `capabilities.inbound_images`, a fetchable event includes
+`inbound_image: { "status": "available", "artifact_id": "incoming_…" }`.
+Unsupported attachment shapes use `{ "status": "unsupported" }`. Group,
+unverified and self-sent events never produce a fetchable descriptor. The
+receive loop does not download attachments.
+
+The host must authorize the exact sender and conversation before issuing
+`{"op":"fetch_inbound_image","id":"request-id","message_guid":"…","artifact_id":"incoming_…"}`.
+The worker consumes the matching descriptor at most once. Its response includes
+`event: "inbound_image"`, the request ID, original GUID, artifact ID, MIME,
+byte count, and SHA-256. The resulting file is mode 0600 in the fixed private
+`inbound-media` subdirectory and named by the artifact ID. The host can read,
+validate and remove it. No encryption keys, download URLs, filenames, or image
+bytes appear in event metadata.
+
+The worker accepts up to 10 MiB per image, limits in-memory descriptors, and
+prunes abandoned files after their two-minute retention window. Remote
+downloads use only Apple HTTPS endpoints, without redirects, and verify the
+encrypted file signature before decryption. Unsupported, expired, malformed or
+failed downloads return static diagnostics. Restart discards pending descriptors.
+
 ## Inbound events
 
 `message` events retain native message ID, sender, source time, conversation,
