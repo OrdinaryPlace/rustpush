@@ -170,6 +170,12 @@ video track with optional audio for video. It derives the MIME, Apple Uniform
 Type Identifier and safe filename from the validated format. The host handles
 conversion and codec validation before staging.
 
+`capabilities.contact_cards:true` advertises support for Buddy's contact card
+through `prepare_media`. The format is a single UTF-8 vCard 3.0 with CRLF line
+endings, at most 128 KiB. It must include a formatted name, a structured name
+and an email address or telephone field. The worker sends it as `text/vcard`
+with the Apple identifier `public.vcard` and the filename `Buddy.vcf`.
+
 Preparation remains offline and persists the same native GUID and content
 binding. Dispatch snapshots and rechecks the approved bytes, actor and audience,
 then persists `dispatching` before the 60-second MMCS upload budget. It persists

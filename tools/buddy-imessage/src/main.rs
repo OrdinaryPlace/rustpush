@@ -101,7 +101,7 @@ const FEEDBACK_SEND_BUDGET: Duration = Duration::from_secs(2);
 const MEDIA_UPLOAD_BUDGET: Duration = Duration::from_secs(60);
 
 fn ready_event() -> Value {
-    json!({"event":"ready","connected":false,"network_contacted":false,"capabilities":{"typing":true,"feedback":true,"images":true,"media":true,"inbound_images":true,"guarded_group_text":true}})
+    json!({"event":"ready","connected":false,"network_contacted":false,"capabilities":{"typing":true,"feedback":true,"images":true,"media":true,"contact_cards":true,"inbound_images":true,"guarded_group_text":true}})
 }
 
 async fn typing_status<F, E>(send: F, budget: Duration) -> &'static str
@@ -1051,7 +1051,7 @@ mod tests {
     #[test]
     fn ready_advertises_typing_without_connection_or_private_identifiers() {
         assert_eq!(ready_event(), json!({"event":"ready","connected":false,"network_contacted":false,
-            "capabilities":{"typing":true,"feedback":true,"images":true,"media":true,"inbound_images":true,"guarded_group_text":true}}));
+            "capabilities":{"typing":true,"feedback":true,"images":true,"media":true,"contact_cards":true,"inbound_images":true,"guarded_group_text":true}}));
     }
 
     fn image_command(directory: &Path) -> Command {
@@ -1103,6 +1103,8 @@ mod tests {
         for (bytes, mime, artifact_id) in [
             (&include_bytes!("../fixtures/audio.m4a")[..], "audio/mp4", "audio_0123456789abcdef"),
             (&include_bytes!("../fixtures/video.mp4")[..], "video/mp4", "video_0123456789abcdef"),
+            (b"BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Buddy\r\nN:;Buddy;;;\r\nEMAIL:buddy@example.test\r\nEND:VCARD\r\n",
+                "text/vcard", "media_0123456789abcdef"),
         ] {
             use sha2::Digest;
             let spool = directory.0.join("outbound-media");
@@ -1122,6 +1124,10 @@ mod tests {
             assert_eq!(report["media"], json!({"artifact_id":artifact_id,"sha256":hash,"mime":mime,"size":bytes.len()}));
             assert!(report["image"].is_null());
             assert!(report.get("image_upload").is_none());
+            if mime == "text/vcard" {
+                let binding = first.attachment.as_ref().unwrap();
+                assert_eq!((binding.mime.uti(), binding.mime.name()), ("public.vcard", "Buddy.vcf"));
+            }
         }
     }
 

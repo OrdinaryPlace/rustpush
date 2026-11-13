@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use crate::{Conversation, Result, WorkerError, require_private_directory};
 
 pub const MAX_MEDIA_BYTES: usize = 10 * 1024 * 1024;
+const MAX_VCARD_BYTES: usize = 128 * 1024;
 pub const MAX_IMAGE_DIMENSION: u32 = 8192;
 pub const MAX_IMAGE_PIXELS: u64 = 16_000_000;
 
@@ -45,22 +46,40 @@ pub enum MediaType {
     M4a,
     #[serde(rename = "video/mp4")]
     Mp4,
+    #[serde(rename = "text/vcard")]
+    VCard,
 }
 
 impl MediaType {
     pub fn is_image(self) -> bool { matches!(self, Self::Png | Self::Jpeg) }
 
     pub fn mime(self) -> &'static str {
-        match self { Self::Png => "image/png", Self::Jpeg => "image/jpeg", Self::M4a => "audio/mp4", Self::Mp4 => "video/mp4" }
+        match self {
+            Self::Png => "image/png", Self::Jpeg => "image/jpeg", Self::M4a => "audio/mp4",
+            Self::Mp4 => "video/mp4", Self::VCard => "text/vcard",
+        }
     }
 
     // Apple Uniform Type Identifiers for the compatible attachment formats.
     pub fn uti(self) -> &'static str {
-        match self { Self::Png => "public.png", Self::Jpeg => "public.jpeg", Self::M4a => "public.mpeg-4-audio", Self::Mp4 => "public.mpeg-4" }
+        match self {
+            Self::Png => "public.png", Self::Jpeg => "public.jpeg", Self::M4a => "public.mpeg-4-audio",
+            Self::Mp4 => "public.mpeg-4", Self::VCard => "public.vcard",
+        }
     }
 
     pub fn name(self) -> &'static str {
-        match self { Self::Png => "image.png", Self::Jpeg => "image.jpg", Self::M4a => "audio.m4a", Self::Mp4 => "video.mp4" }
+        match self {
+            Self::Png => "image.png", Self::Jpeg => "image.jpg", Self::M4a => "audio.m4a",
+            Self::Mp4 => "video.mp4", Self::VCard => "Buddy.vcf",
+        }
+    }
+
+    fn max_size(self) -> usize {
+        match self {
+            Self::VCard => MAX_VCARD_BYTES,
+            _ => MAX_MEDIA_BYTES,
+        }
     }
 }
 
@@ -210,6 +229,56 @@ fn mp4(mut bytes: &[u8], video: bool) -> Result<()> {
     if (video && tracks.1 == 1) || (!video && tracks.0 == 1) { Ok(()) } else { Err(INVALID_MP4) }
 }
 
+const INVALID_VCARD: WorkerError = WorkerError("invalid_vcard_format");
+
+fn vcard(bytes: &[u8]) -> Result<()> {
+    // The host produces one vCard 3.0 in UTF-8 with CRLF and folded long properties.
+    let body = std::str::from_utf8(bytes).ok()
+        .and_then(|card| card.strip_prefix("BEGIN:VCARD\r\nVERSION:3.0\r\n"))
+        .and_then(|body| body.strip_suffix("\r\nEND:VCARD\r\n"))
+        .ok_or(INVALID_VCARD)?;
+    let mut fields = Vec::<String>::new();
+    for line in body.split("\r\n") {
+        let continuation = line.starts_with([' ', '\t']);
+        let value = if continuation { &line[1..] } else { line };
+        if value.is_empty() || value.chars().any(char::is_control) {
+            return Err(INVALID_VCARD);
+        }
+        if continuation {
+            fields.last_mut().ok_or(INVALID_VCARD)?.push_str(value);
+        } else {
+            fields.push(value.into());
+        }
+    }
+
+    let mut formatted_name = false;
+    let mut structured_name = false;
+    let mut has_handle = false;
+    for field in fields {
+        let (header, value) = field.split_once(':').ok_or(INVALID_VCARD)?;
+        let property = header.split(';').next().unwrap_or_default();
+        let name = match property.split_once('.') {
+            Some((group, name)) if vcard_token(group) => name,
+            Some(_) => return Err(INVALID_VCARD),
+            None => property,
+        };
+        if !vcard_token(name) { return Err(INVALID_VCARD); }
+        match name.to_ascii_uppercase().as_str() {
+            "BEGIN" | "END" | "VERSION" => return Err(INVALID_VCARD),
+            "FN" if !value.trim().is_empty() && !formatted_name => formatted_name = true,
+            "N" if !value.trim().is_empty() && !structured_name => structured_name = true,
+            "FN" | "N" => return Err(INVALID_VCARD),
+            "EMAIL" | "TEL" if !value.trim().is_empty() => has_handle = true,
+            _ => {}
+        }
+    }
+    if formatted_name && structured_name && has_handle { Ok(()) } else { Err(INVALID_VCARD) }
+}
+
+fn vcard_token(token: &str) -> bool {
+    !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
 pub fn read_artifact(directory: &Path, id: &str, conversation: &Conversation) -> Result<(MediaBinding, Vec<u8>)> {
     if !artifact_id(id) { return Err(WorkerError("invalid_media_artifact")); }
     require_private_directory(directory)?;
@@ -219,12 +288,13 @@ pub fn read_artifact(directory: &Path, id: &str, conversation: &Conversation) ->
         .map_err(|_| WorkerError("invalid_media_artifact"))?;
     let mut recipients = manifest.participants.clone(); recipients.sort();
     let mut expected = conversation.participants.clone(); expected.sort();
+    let size_limit = manifest.mime.max_size();
     if manifest.format != 1 || manifest.artifact_id != id || recipients != expected || recipients.len() != 2
-        || recipients[0] == recipients[1] || manifest.size == 0 || manifest.size > MAX_MEDIA_BYTES as u64
+        || recipients[0] == recipients[1] || manifest.size == 0 || manifest.size > size_limit as u64
         || manifest.sha256.len() != 64 || !manifest.sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
         return Err(WorkerError("invalid_media_artifact"));
     }
-    let bytes = read_file(&spool.join(format!("{id}.bin")), MAX_MEDIA_BYTES)?;
+    let bytes = read_file(&spool.join(format!("{id}.bin")), size_limit)?;
     if bytes.len() as u64 != manifest.size || format!("{:x}", Sha256::digest(&bytes)) != manifest.sha256 {
         return Err(WorkerError("media_artifact_changed"));
     }
@@ -232,6 +302,7 @@ pub fn read_artifact(directory: &Path, id: &str, conversation: &Conversation) ->
         MediaType::Png | MediaType::Jpeg => Some(validate_image(&bytes, manifest.mime)?),
         MediaType::M4a => { mp4(&bytes, false)?; None },
         MediaType::Mp4 => { mp4(&bytes, true)?; None },
+        MediaType::VCard => { vcard(&bytes)?; None },
     };
     let (width, height) = dimensions.unzip();
     Ok((MediaBinding { artifact_id: id.into(), sha256: manifest.sha256, mime: manifest.mime,
@@ -273,6 +344,19 @@ mod tests {
         assert_eq!((binding.mime.uti(),binding.mime.name()), ("public.png","image.png"));
         conversation.participants[0] = "tel:+15555550999".into();
         assert!(read_artifact(&directory.0, ID, &conversation).is_err());
+    }
+    #[test]
+    fn vcard_requires_one_well_framed_contact_with_a_reachable_field() {
+        assert!(vcard(b"BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Buddy\r\nN:;Buddy;;;\r\nitem1.EMAIL:buddy@example.test\r\nitem1.X-ABLabel:iMessage\r\nPHOTO;ENCODING=b;TYPE=JPEG:YW\r\n Jj\r\nEND:VCARD\r\n").is_ok());
+        for card in [
+            "BEGIN:VCARD\nVERSION:3.0\nFN:Buddy\nN:;Buddy;;;\nEMAIL:buddy@example.test\nEND:VCARD\n",
+            "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Buddy\r\nN:;Buddy;;;\r\nEND:VCARD\r\n",
+            "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Buddy\r\nN:;Buddy;;;\r\nEMAIL:buddy@example.testEND:VCARD\r\n",
+            "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Buddy\r\nN:;Buddy;;;\r\nTEL:+15555550100\r\nEND:VCARD\r\nBEGIN:VCARD\r\nEND:VCARD\r\n",
+            "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Buddy\0\r\nN:;Buddy;;;\r\nTEL:+15555550100\r\nEND:VCARD\r\n",
+        ] {
+            assert!(vcard(card.as_bytes()).is_err());
+        }
     }
     #[test]
     fn rejects_paths_urls_unknown_fields_duplicates_hash_size_and_mime_changes() {
