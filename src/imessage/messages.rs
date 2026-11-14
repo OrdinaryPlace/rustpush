@@ -775,6 +775,8 @@ pub struct NormalMessage {
     pub effect: Option<String>,
     pub reply_guid: Option<String>,
     pub reply_part: Option<String>,
+    #[serde(skip)]
+    pub invalid_reply_reference: bool,
     pub service: MessageType,
     pub subject: Option<String>,
     pub app: Option<ExtensionApp>,
@@ -795,7 +797,7 @@ impl NormalMessage {
     /// Return only the unformatted, single-part text shape used by feedback.
     pub fn plain_feedback_text(&self) -> Option<&str> {
         if self.service != MessageType::IMessage || self.effect.is_some() || self.reply_guid.is_some()
-            || self.reply_part.is_some() || self.subject.is_some() || self.app.is_some() || self.link_meta.is_some()
+            || self.reply_part.is_some() || self.invalid_reply_reference || self.subject.is_some() || self.app.is_some() || self.link_meta.is_some()
             || self.voice || self.scheduled.is_some() || self.embedded_profile.is_some() { return None; }
         match self.parts.0.as_slice() {
             [IndexedMessagePart { part: MessagePart::Text(text, TextFormat::Flags(TextFlags {
@@ -814,6 +816,7 @@ impl NormalMessage {
             effect: None,
             reply_guid: None,
             reply_part: None,
+            invalid_reply_reference: false,
             service,
             subject: None,
             app: None,
@@ -823,6 +826,22 @@ impl NormalMessage {
             embedded_profile: None,
         }
     }
+}
+
+fn parse_imessage_reply(value: &Value) -> Option<(String, String)> {
+    let envelope = value.as_string()?.strip_prefix("r:")?;
+    if envelope.len() > 128 { return None; }
+    let mut guid = None;
+    let mut selector = Vec::new();
+    for field in envelope.split(':') {
+        if Uuid::parse_str(field).is_ok() {
+            if guid.is_some() { return None; }
+            guid = Some(field.to_string());
+        } else {
+            selector.push(field);
+        }
+    }
+    Some((guid?, selector.join(":")))
 }
 
 // Native Polls construction and receive extraction. These helpers operate on
@@ -2586,7 +2605,8 @@ impl MessageInst {
                             v: "1".to_string(),
                             effect: normal.effect.clone(),
                             cv_name: conversation.cv_name.clone(),
-                            reply: normal.reply_guid.as_ref().map(|guid| format!("r:{}:{}", normal.reply_part.as_ref().unwrap(), guid)),
+                            reply: normal.reply_guid.as_ref().zip(normal.reply_part.as_ref())
+                                .map(|(guid, part)| Value::String(format!("r:{part}:{guid}"))),
                             inline0: None,
                             inline1: None,
                             live_xml: None,
@@ -3095,6 +3115,7 @@ impl MessageInst {
                     effect: None, // losers
                     reply_guid: None, // losers
                     reply_part: None, // losers
+                    invalid_reply_reference: false,
                     service: MessageType::SMS { // shame
                         is_phone: false, // if we are recieving a incoming message (over apns), we must not be the phone
                         using_number: normalize_sms_handle(&loaded.recieved_number),
@@ -3127,6 +3148,7 @@ impl MessageInst {
                 effect: None, // losers
                 reply_guid: None, // losers
                 reply_part: None, // losers
+                invalid_reply_reference: false,
                 service: MessageType::SMS { // shame
                     is_phone: false, // if we are recieving a outgoing message, we must not be the phone
                     using_number: wrapper.sender.clone().unwrap(),
@@ -3141,14 +3163,8 @@ impl MessageInst {
             }))
         }
         if let Ok(loaded) = plist::from_value::<RawIMessage>(&value) {
-            let replies = loaded.reply.as_ref().map(|to| {
-                let mut parts: Vec<&str> = to.split(":").collect();
-                parts.remove(0); // remove r:
-                let guididx = parts.iter().position(|p| p.contains("-")).unwrap();
-                let guid = parts[guididx].to_string();
-                parts.remove(guididx);
-                (guid, parts.join(":"))
-            });
+            let replies = loaded.reply.as_ref().and_then(parse_imessage_reply);
+            let invalid_reply_reference = loaded.reply.is_some() && replies.is_none();
             let parts = loaded.live_xml.as_ref().or(loaded.xml.as_ref()).map_or_else(|| {
                 loaded.text.as_ref().map_or(MessageParts(vec![]), |text| MessageParts::from_raw(text))
             }, |xml| {
@@ -3214,6 +3230,7 @@ impl MessageInst {
                 effect: loaded.effect.clone(),
                 reply_guid: replies.as_ref().map(|r| r.0.clone()),
                 reply_part: replies.as_ref().map(|r| r.1.clone()),
+                invalid_reply_reference,
                 service: MessageType::IMessage,
                 subject: loaded.subject.clone(),
                 app,
@@ -3236,6 +3253,47 @@ impl MessageInst {
 impl fmt::Display for MessageInst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "[{}] '{}'", self.sender.clone().unwrap_or("unknown".to_string()), self.message)
+    }
+}
+
+#[cfg(test)]
+mod imessage_reply_tests {
+    use super::*;
+
+    fn raw_message(reply: Option<Value>) -> RawIMessage {
+        let mut plist = Dictionary::new();
+        plist.insert("t".into(), Value::String("Yes".into()));
+        plist.insert("p".into(), Value::Array(vec![]));
+        plist.insert("gv".into(), Value::String("8".into()));
+        plist.insert("v".into(), Value::String("1".into()));
+        if let Some(reply) = reply { plist.insert("tg".into(), reply); }
+        let bytes = plist_to_bin(&plist).unwrap();
+        plist::from_bytes(&bytes).unwrap()
+    }
+
+    #[test]
+    fn raw_imessage_reply_keeps_the_native_target_and_selector() {
+        let guid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        for field in [format!("r:0:0:12:{guid}"), format!("r:{guid}:0:0:12")] {
+            let raw = raw_message(Some(Value::String(field)));
+            assert_eq!(raw.text.as_deref(), Some("Yes"));
+            assert_eq!(raw.reply.as_ref().and_then(parse_imessage_reply),
+                Some((guid.into(), "0:0:12".into())));
+        }
+    }
+
+    #[test]
+    fn malformed_reply_metadata_neither_erases_text_nor_supplies_a_target() {
+        let ordinary = raw_message(None);
+        assert!(ordinary.reply.is_none());
+        let guid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        for field in [Value::String("r:unavailable".into()), Value::Boolean(true),
+            Value::String(format!("r:{guid}:0:{guid}")), Value::String(format!("p:0:{guid}"))] {
+            let raw = raw_message(Some(field));
+            assert!(raw.reply.is_some());
+            assert_eq!(raw.text.as_deref(), Some("Yes"));
+            assert_eq!(raw.reply.as_ref().and_then(parse_imessage_reply), None);
+        }
     }
 }
 
