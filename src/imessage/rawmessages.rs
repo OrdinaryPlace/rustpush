@@ -428,7 +428,7 @@ struct RawIMessage {
     #[serde(rename = "n")]
     cv_name: Option<String>,
     #[serde(rename = "tg")]
-    reply: Option<String>,
+    reply: Option<Value>,
     #[serde(rename = "ia-0")]
     inline0: Option<Data>,
     #[serde(rename = "ia-1")]

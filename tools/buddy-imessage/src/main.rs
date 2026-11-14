@@ -830,6 +830,22 @@ fn inbound_event(handles: &[String], message: &MessageInst, connected_at_ms: u64
         "initial_connection_window":received_at_ms.saturating_sub(connected_at_ms) < 30_000,
         "verification_failed":message.verification_failed,
         "conversation":conversation});
+    if let Message::Message(normal) = &message.message {
+        if normal.service == MessageType::IMessage && (normal.invalid_reply_reference
+            || normal.reply_guid.is_some() || normal.reply_part.is_some()) {
+            let target = normal.reply_guid.as_deref().and_then(|guid| uuid::Uuid::parse_str(guid).ok());
+            if let Some(guid) = target {
+                event["reply_to_message_id"] = json!(guid.to_string().to_uppercase());
+                if let Some(part) = normal.reply_part.as_deref().filter(|part| !part.is_empty()) {
+                    let valid = part.len() <= 64 && part.split(':').all(|field| !field.is_empty()
+                        && field.bytes().all(|byte| byte.is_ascii_digit()));
+                    event["reply_to_part"] = json!(valid.then_some(part));
+                }
+            } else {
+                event["reply_to_message_id"] = Value::Null;
+            }
+        }
+    }
     match message.native_poll_event() {
         Ok(Some(poll)) => {
             let (kind, payload) = match poll.data.payload {
@@ -856,6 +872,18 @@ fn inbound_event(handles: &[String], message: &MessageInst, connected_at_ms: u64
             Message::Delivered => { event["kind"] = json!("delivery_receipt"); }
             Message::Read => { event["kind"] = json!("read_receipt"); }
             Message::React(_) => { event["kind"] = json!("reaction"); }
+            Message::Unsend(unsend) => {
+                event["kind"] = json!("unsupported");
+                // The host resolves text references, so only text part 0 is
+                // relevant. Unsend carries no conversation binding.
+                if unsend.edit_part == 0 && message.authenticated_madrid_payload && !message.verification_failed
+                    && message.sender.as_ref().is_some_and(|sender| !sender.is_empty()) {
+                    if let Ok(guid) = uuid::Uuid::parse_str(&unsend.tuuid) {
+                        event["kind"] = json!("unsend");
+                        event["unsent_message_id"] = json!(guid.to_string().to_uppercase());
+                    }
+                }
+            }
             Message::ChangeParticipants(change) => {
                 event["kind"] = json!("unsupported");
                 event["group_change"] = json!({"participants":change.new_participants,"version":change.group_version});
@@ -1477,6 +1505,79 @@ mod tests {
         assert_eq!(event["inbound_image"]["status"], "available");
         assert!(!event.to_string().contains("synthetic.png"));
         assert!(!event.to_string().contains("iVBOR"));
+    }
+
+    #[test]
+    fn inbound_inline_reply_preserves_only_the_validated_association() {
+        let Command::PreparePoll { conversation, .. } = poll_command() else { panic!("Expected direct conversation") };
+        let sender = conversation.participants[1].clone();
+        let target = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut normal = NormalMessage::new("Yes".into(), MessageType::IMessage);
+        let mut message = MessageInst::new(conversation.protocol(), &sender, Message::Message(normal.clone()));
+
+        let event = inbound_event(&[], &message, 0, 31_000);
+        assert_eq!(event["kind"], "text");
+        assert!(event.get("reply_to_message_id").is_none());
+
+        normal.reply_guid = Some(target.into());
+        normal.reply_part = Some("0:0:12".into());
+        message.message = Message::Message(normal.clone());
+        let event = inbound_event(&[], &message, 0, 31_000);
+        assert_eq!(event["text"], "Yes");
+        assert_eq!(event["reply_to_message_id"], target.to_uppercase());
+        assert_eq!(event["reply_to_part"], "0:0:12");
+        assert_ne!(event["message_id"], event["reply_to_message_id"]);
+
+        normal.reply_part = Some("arbitrary metadata".into());
+        message.message = Message::Message(normal.clone());
+        let event = inbound_event(&[], &message, 0, 31_000);
+        assert_eq!(event.get("reply_to_part"), Some(&Value::Null));
+
+        normal.reply_part = Some(String::new());
+        message.message = Message::Message(normal.clone());
+        let event = inbound_event(&[], &message, 0, 31_000);
+        assert!(event.get("reply_to_part").is_none());
+
+        normal.reply_guid = None;
+        normal.reply_part = None;
+        normal.invalid_reply_reference = true;
+        message.message = Message::Message(normal);
+        let event = inbound_event(&[], &message, 0, 31_000);
+        assert_eq!(event["text"], "Yes");
+        assert_eq!(event.get("reply_to_message_id"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn only_authenticated_unsend_exposes_the_target_without_conversation() {
+        let Command::PreparePoll { conversation, .. } = poll_command() else { panic!("Expected direct conversation") };
+        let sender = conversation.participants[1].clone();
+        let target = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut message = MessageInst::new(conversation.protocol(), &sender,
+            Message::Unsend(rustpush::UnsendMessage { tuuid: target.into(), edit_part: 0 }));
+        message.conversation = None;
+
+        let event = inbound_event(&[], &message, 0, 31_000);
+        assert_eq!(event["kind"], "unsupported");
+        assert!(event.get("unsent_message_id").is_none());
+
+        message.authenticated_madrid_payload = true;
+        let event = inbound_event(&[], &message, 0, 31_000);
+        assert_eq!(event["kind"], "unsend");
+        assert_eq!(event["sender"], sender);
+        assert_eq!(event["conversation"], Value::Null);
+        assert_eq!(event["unsent_message_id"], target.to_uppercase());
+        assert_ne!(event["message_id"], event["unsent_message_id"]);
+
+        message.verification_failed = true;
+        let event = inbound_event(&[], &message, 0, 31_000);
+        assert_eq!(event["kind"], "unsupported");
+        assert!(event.get("unsent_message_id").is_none());
+
+        message.verification_failed = false;
+        message.message = Message::Unsend(rustpush::UnsendMessage { tuuid: target.into(), edit_part: 1 });
+        let event = inbound_event(&[], &message, 0, 31_000);
+        assert_eq!(event["kind"], "unsupported");
+        assert!(event.get("unsent_message_id").is_none());
     }
 
     #[test]

@@ -282,6 +282,14 @@ failed downloads return static diagnostics. Restart discards pending descriptors
 `from_me` and `verification_failed`. Kinds include `text`, `poll`, `poll_vote`,
 receipts, reactions and explicit unsupported content. Native polls expose their
 typed JSON plus original poll GUID/part/session before flattening can discard it.
+For explicit iMessage replies, the worker carries the parsed `tg` reference as
+`reply_to_message_id`, an uppercase UUID, and includes the optional numeric
+`reply_to_part` selector. Malformed references have a null target, and a
+malformed supplied selector is null. Ordinary messages omit both fields.
+An authenticated native unsend of text part zero includes
+`kind:"unsend"` and `unsent_message_id`. Its payload has no conversation
+binding, so the host must first authorize the target and match its sender
+against the verified one on the unsend event.
 Every message also has a static `message_type` variant category. Unsupported
 events can therefore distinguish typing, profile updates, cache invalidation
 and other protocol events without serializing their bodies. A typed
