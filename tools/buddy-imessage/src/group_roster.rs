@@ -2,7 +2,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use buddy_imessage::{Conversation, GroupGuard, Result, WorkerError, valid_handle};
+use buddy_imessage::{Conversation, GroupGuard, MAX_CONVERSATION_PARTICIPANTS, Result, WorkerError, valid_handle};
 use rustpush::{APSSendGuard, APSIngressSnapshot, ConversationData, Message, MessageInst, MessageType};
 use serde::Serialize;
 use uuid::Uuid;
@@ -46,7 +46,7 @@ fn canonical_handle(value: &str) -> Option<String> {
 }
 
 fn exact_roster(participants: &[String]) -> Option<Vec<String>> {
-    if participants.len() != 3 { return None; }
+    if !(3..=MAX_CONVERSATION_PARTICIPANTS).contains(&participants.len()) { return None; }
     let mut roster = participants.iter().map(|value| canonical_handle(value)).collect::<Option<Vec<_>>>()?;
     roster.sort_unstable();
     if roster.windows(2).any(|pair| pair[0] == pair[1]) { return None; }
@@ -193,6 +193,7 @@ mod tests {
     const ACTOR: &str = "mailto:worker@example.test";
     const PEER_A: &str = "mailto:participant-a@example.test";
     const PEER_B: &str = "mailto:participant-b@example.test";
+    const PEER_C: &str = "mailto:participant-c@example.test";
     const THREAD: &str = "00b5f85a-d891-4714-8557-b997ef8f6bc0";
     const SIBLING: &str = "4e038aa2-d497-4293-b994-7316fa715f12";
     const START: u64 = 100_000;
@@ -238,6 +239,48 @@ mod tests {
         assert_eq!(bound.conversation.cv_name.as_deref(), Some("Synthetic"));
         assert_eq!(bound.participant_version, 3);
         assert!(roster.bind(&request, &guard, NOW + MAX_ROSTER_AGE_MS + 1).is_err());
+    }
+
+    #[test]
+    fn a_larger_group_binds_only_the_exact_verified_roster() {
+        let mut roster = GroupRoster::new(ingress(1, 0));
+        let first = message(THREAD, PEER_A, &[ACTOR, PEER_A, PEER_B, PEER_C]);
+        let membership = observe(&mut roster, &first).unwrap();
+        let reordered = message(THREAD, PEER_C, &[PEER_C, PEER_B, PEER_A, ACTOR]);
+        assert_eq!(observe(&mut roster, &reordered), Some(membership.clone()));
+        let guard = group_guard(THREAD, &membership);
+        let request = Conversation { participants: membership.participants.clone(), sender_guid: Some(THREAD.into()),
+            cv_name: None, after_guid: None };
+        assert!(roster.bind(&request, &guard, NOW).is_ok());
+        assert!(operation_matches(&guard, &request.protocol()));
+        let mut omitted = request.clone();
+        omitted.participants.retain(|handle| handle != PEER_C);
+        assert!(roster.bind(&omitted, &guard, NOW).is_err());
+        assert!(!operation_matches(&guard, &omitted.protocol()));
+
+        let roster = Arc::new(Mutex::new(roster));
+        let guard = transport_guard(roster.clone(), guard, 3, || NOW);
+        assert!(guard(ingress(1, 0)));
+        assert!(!guard(ingress(1, 1)));
+        assert!(!guard(ingress(2, 0)));
+        let changed = message(THREAD, PEER_A, &[ACTOR, PEER_A, PEER_B, "mailto:replacement@example.test"]);
+        {
+            let mut roster = roster.lock().unwrap();
+            roster.processed(ingress(1, 1));
+            assert!(observe(&mut roster, &changed).is_none());
+            assert!(observe(&mut roster, &first).is_none());
+        }
+        assert!(!guard(ingress(1, 1)));
+    }
+
+    #[test]
+    fn exact_roster_is_bounded_and_rejects_duplicate_aliases() {
+        let participants: Vec<_> = (0..=MAX_CONVERSATION_PARTICIPANTS)
+            .map(|index| format!("mailto:participant-{index}@example.test")).collect();
+        assert!(exact_roster(&participants[..2]).is_none());
+        assert!(exact_roster(&participants[..MAX_CONVERSATION_PARTICIPANTS]).is_some());
+        assert!(exact_roster(&participants).is_none());
+        assert!(exact_roster(&[ACTOR.into(), PEER_A.into(), PEER_B.into(), PEER_B.to_ascii_uppercase()]).is_none());
     }
 
     #[test]

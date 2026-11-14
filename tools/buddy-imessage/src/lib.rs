@@ -243,9 +243,11 @@ pub struct GroupGuard {
     pub revision: u64,
 }
 
+pub const MAX_CONVERSATION_PARTICIPANTS: usize = 32;
+
 impl Conversation {
     pub fn validate(&self, own_handle: &str) -> Result<()> {
-        if self.participants.is_empty() || self.participants.len() > 32 { return Err(WorkerError("invalid_conversation")); }
+        if self.participants.is_empty() || self.participants.len() > MAX_CONVERSATION_PARTICIPANTS { return Err(WorkerError("invalid_conversation")); }
         let mut seen = HashSet::new();
         for handle in &self.participants {
             if !valid_handle(handle) || !seen.insert(handle) { return Err(WorkerError("invalid_conversation")); }

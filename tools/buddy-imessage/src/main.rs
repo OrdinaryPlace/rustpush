@@ -101,7 +101,7 @@ const FEEDBACK_SEND_BUDGET: Duration = Duration::from_secs(2);
 const MEDIA_UPLOAD_BUDGET: Duration = Duration::from_secs(60);
 
 fn ready_event() -> Value {
-    json!({"event":"ready","connected":false,"network_contacted":false,"capabilities":{"typing":true,"feedback":true,"images":true,"media":true,"contact_cards":true,"inbound_images":true,"guarded_group_text":true}})
+    json!({"event":"ready","connected":false,"network_contacted":false,"capabilities":{"typing":true,"feedback":true,"images":true,"media":true,"contact_cards":true,"inbound_images":true,"guarded_group_text":true,"guarded_group_max_participants":buddy_imessage::MAX_CONVERSATION_PARTICIPANTS}})
 }
 
 async fn typing_status<F, E>(send: F, budget: Duration) -> &'static str
@@ -1051,7 +1051,7 @@ mod tests {
     #[test]
     fn ready_advertises_typing_without_connection_or_private_identifiers() {
         assert_eq!(ready_event(), json!({"event":"ready","connected":false,"network_contacted":false,
-            "capabilities":{"typing":true,"feedback":true,"images":true,"media":true,"contact_cards":true,"inbound_images":true,"guarded_group_text":true}}));
+            "capabilities":{"typing":true,"feedback":true,"images":true,"media":true,"contact_cards":true,"inbound_images":true,"guarded_group_text":true,"guarded_group_max_participants":32}}));
     }
 
     fn image_command(directory: &Path) -> Command {
